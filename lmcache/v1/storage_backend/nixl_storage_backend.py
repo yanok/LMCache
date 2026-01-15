@@ -338,6 +338,8 @@ class NixlStorageAgent(ABC):
 
         while state != "DONE" and state != "ERR":
             try:
+                time.sleep(0.001)
+                #time.sleep(0)
                 state = self.nixl_agent.check_xfer_state(handle)
             except nixlBind.nixlBackendError:
                 raise
