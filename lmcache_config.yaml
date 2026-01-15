@@ -1,0 +1,15 @@
+chunk_size: 512
+local_cpu: false
+
+  #nixl_buffer_size: 1048576000
+  #nixl_buffer_size: 5368709120
+nixl_buffer_size: 10737418240
+nixl_buffer_device: cuda
+extra_config:
+  enable_nixl_storage: true
+  nixl_backend: GDS_MT
+  nixl_pool_size: 512
+  nixl_path: /mnt/vast/tshmilovich/nixl
+  use_direct_io: True
+  nixl_backend_params:
+    thread_count: "8"

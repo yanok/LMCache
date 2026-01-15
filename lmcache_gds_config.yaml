@@ -1,0 +1,6 @@
+chunk_size: 512
+local_cpu: false
+gds_path: /mnt/vast/tshmilovich/gds
+  #cufile_buffer_size: 5120
+cufile_buffer_size: 10240
+extra_config: {}

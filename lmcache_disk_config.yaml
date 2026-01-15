@@ -1,0 +1,7 @@
+chunk_size: 512
+local_cpu: false
+local_disk: /mnt/vast/tshmilovich/disk
+max_local_disk_size: 10
+  #cufile_buffer_size: 5120
+extra_config: 
+  use_odirect: "true"

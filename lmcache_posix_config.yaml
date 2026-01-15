@@ -1,0 +1,14 @@
+chunk_size: 512
+local_cpu: false
+
+  #nixl_buffer_size: 5368709120
+nixl_buffer_size: 10737418240
+nixl_buffer_device: cpu
+extra_config:
+  enable_nixl_storage: true
+  nixl_backend: POSIX
+  nixl_pool_size: 512
+  nixl_path: /mnt/vast/tshmilovich/posix
+  use_direct_io: True
+  #nixl_backend_params:
+    #use_uring: "true"
