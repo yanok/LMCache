@@ -96,12 +96,14 @@ class NixlStorageConfig:
         if dynamic_storage:  # For now only supports OBJ backend
             if backend in ("OBJ",):
                 return device == "cpu" or device == "cuda"
+            elif backend in ("DOCA_MEMOS"):
+                return device == "cpu"
             else:
                 return False
         else:
             if backend in ("GDS", "GDS_MT", "OBJ"):
                 return device == "cpu" or device == "cuda"
-            elif backend in ("POSIX", "HF3FS"):
+            elif backend in ("POSIX", "HF3FS", "DOCA_MEMOS"):
                 return device == "cpu"
             else:
                 return False
@@ -517,7 +519,7 @@ class NixlDynamicStorageAgent(NixlStorageAgent):
             allocator, device, backend, backend_params, enable_prog_thread, sync_mode
         )
 
-        if backend == "OBJ":
+        if backend in ("OBJ", "DOCA_MEMOS"):
             self.mem_type = "OBJ"
         else:
             # Already validated in validate_nixl_backend
@@ -832,7 +834,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
     def createPool(backend: str, size: int, path: str, use_direct_io: bool):
         if backend in ("GDS", "GDS_MT", "POSIX", "HF3FS"):
             return NixlFilePool(size, path, use_direct_io)
-        elif backend in ("OBJ"):
+        elif backend in ("OBJ", "DOCA_MEMOS"):
             return NixlObjectPool(size)
         else:
             raise ValueError(f"Unsupported NIXL backend: {backend}")
