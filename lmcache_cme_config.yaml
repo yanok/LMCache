@@ -1,0 +1,14 @@
+chunk_size: 512
+local_cpu: false
+
+  #nixl_buffer_size: 1048576000
+  #nixl_buffer_size: 5368709120
+nixl_buffer_size: 10737418240
+nixl_buffer_device: cpu
+extra_config:
+  enable_nixl_storage: true
+  nixl_pool_size: 0  # disable static object pool
+  nixl_backend: DOCA_KV
+  nixl_backend_params:
+    device_name: "/tmp/doca_kv_storage"
+ 
