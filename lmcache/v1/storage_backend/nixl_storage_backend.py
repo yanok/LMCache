@@ -1288,6 +1288,11 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                     "use_direct_io is True, but O_DIRECT is not available on "
                     "this system. Falling back to buffered I/O."
                 )
+        if nixl_config.backend == "DOCA_MEMOS":
+            # DOCA_MEMOS needs keys to fit into 128 bits
+            self._format_object_key = self._format_object_key_b128
+        else:
+            self._format_object_key = self._format_object_key_url_safe
         # Presence cache to reduce remote contains checks
         self.hit_counter = 0
         self.total_counter = 0
@@ -1390,10 +1395,23 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             f"fmt: {self.meta_fmt}"
         )
 
-    def _format_object_key(self, key: CacheEngineKey) -> str:
+    def _format_object_key_b128(self, key: CacheEngineKey) -> str:
         """
-        Generate object key name based on CacheEngineKey information.
-        Similar to s3_connector._format_safe_path()
+        Generate a 128-bit object key for the DOCA_MEMOS backend.
+
+        Returns a 32-char hex string (sha256 truncated to 128 bits). Hex encoding
+        is required because the key is passed via NIXL metadata as a string; the
+        NIXL plugin hex-decodes it on the other side.
+        """
+        import hashlib
+        return hashlib.sha256(key.to_string().encode("utf-8")).hexdigest()[:32]
+
+    def _format_object_key_url_safe(self, key: CacheEngineKey) -> str:
+        """
+        Generate a URL-safe object key for non-DOCA_MEMOS backends.
+
+        Replaces slashes and @ signs with underscores, then percent-encodes
+        the result for safe use as an object storage key.
         """
         key_str = key.to_string()
         # Replace slashes with underscores to make it safe for object storage/FS
