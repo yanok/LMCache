@@ -1059,11 +1059,26 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         Generate object key name based on CacheEngineKey information.
         Similar to s3_connector._format_safe_path()
         """
-        key_str = key.to_string()
-        # Replace slashes with underscores to make it safe for object storage
-        flat_key_str = key_str.replace("/", "_").replace("@", "_")
-        # URL encode for safety
-        return url_quote(flat_key_str, safe="")
+        assert key.worker_id < 256
+        world_size_minus_one = key.world_size - 1
+        assert world_size_minus_one < 256
+        layer_id = key.layer_id if hasattr(key, "layer_id") else 0
+        assert layer_id < 256
+        # Keep it minimal, since there might be limits on the key length
+        # We definitely need the chunk hash and worker id, since the chunk hash is
+        # computed _before_ sharding, so there _will_ be same chunk hashes for different workers.
+        # World size is nice to have, so we don't get collisions when we decide to reshard.
+        # I'm not sure whether layer id is strictly necessary.
+        # TODO: Should we just hash it instead?
+        chunk_hash = key.chunk_hash
+        if chunk_hash < 0:
+            chunk_hash = chunk_hash & ((1 << 64) - 1)
+        import struct
+        key_bytes = struct.pack("<QBBB", chunk_hash, key.worker_id, world_size_minus_one, layer_id)
+        import base64
+        encoded_key = base64.b85encode(key_bytes).decode("utf-8")
+        assert len(encoded_key) <= 16
+        return encoded_key
 
     def key_exists(self, key: CacheEngineKey) -> bool:
         if self.agent.mem_type == "OBJ":
