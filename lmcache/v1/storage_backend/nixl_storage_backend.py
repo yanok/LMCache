@@ -541,7 +541,6 @@ class NixlStorageBackend(AllocatorBackendInterface, ABC):
             "enable_nixl_storage"
         )
         assert enable_nixl_storage
-
         corrected_device = get_correct_device(
             config.nixl_buffer_device,
             metadata.worker_id,
