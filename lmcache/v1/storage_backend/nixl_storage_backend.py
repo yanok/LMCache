@@ -1143,37 +1143,29 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             mem_indices, storage_xfer_handler, storage_indices
         )
 
+        statuses = None
         # Try to read the object
         try:
             self.agent.post_blocking(handle)
-            xfer_state = True
         except nixlBind.nixlBackendError as exc:
             logger.warning(f"Batch Transfer failed: {exc}")
-            # Treat "not found", timeout or other transfer failures as recoverable
-            # Do not raise exception to avoid terminating the program
-            xfer_state = False
+            
+            # TODO: we need to busy loop here, to get _all_ statuses
+            # but for now, just get what we can
+            statuses = self.agent.nixl_agent.get_xfer_error_list(handle)
 
         self.agent.release_handle(handle)
         self.agent.release_storage_handler(storage_reg_descs, storage_xfer_handler)
 
-        if xfer_state:
-            for i in range(len(keys)):
+        for i in range(len(keys)):
+            if statuses is None or statuses[i] == nixlBind.NIXL_SUCCESS:
                 key = keys[i]
                 self._cache_add(key.chunk_hash)
-            end_time = time.time()
-            duration = end_time - start_time
-            logger.debug(
-                f"storage_to_mem for {len(keys)} objects size {page_size * len(keys)} "
-                f"took {duration:.6f} seconds"
-            )
-            return obj_list
-        else:
-            # Free the allocated memory and discard cache if transfer failed
-            for obj in obj_list:
+            else:
+                obj = obj_list[i]
                 self.memory_allocator.free(obj)
-            for key in keys:
-                self._cache_discard(key.chunk_hash)
-            return [None] * len(keys)
+                obj_list[i] = None
+        return obj_list
 
     async def _wait_for_transfer(
         self,
