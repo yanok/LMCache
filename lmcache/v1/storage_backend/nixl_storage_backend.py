@@ -1164,10 +1164,12 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         self.agent.release_storage_handler(storage_reg_descs, storage_xfer_handler)
 
         for i in range(len(keys)):
+            key = keys[i]
             if statuses is None or statuses[i] == nixlBind.NIXL_SUCCESS:
-                key = keys[i]
                 self._cache_add(key.chunk_hash)
             else:
+                # If the key failed, mark it as not existing in the presence cache
+                self._cache_discard(key.chunk_hash)
                 obj = obj_list[i]
                 self.memory_allocator.free(obj)
                 obj_list[i] = None
