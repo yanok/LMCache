@@ -1,4 +1,4 @@
-chunk_size: 64
+chunk_size: 128
 local_cpu: false
 
   #nixl_buffer_size: 1048576000
