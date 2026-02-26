@@ -774,14 +774,13 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         Memory allocation and NIXL transfer without locks.
         Can run async and in parallel with other transfers.
         """
-        obj_list: list[Optional[MemoryObj]] = []
+        obj_list: list[Optional[MemoryObj]] = [None] * len(metadata_list)
         mem_indices = []
         storage_indices = []
 
         # Memory allocation outside lock
-        for metadata in metadata_list:
+        for idx, metadata in enumerate(metadata_list):
             if metadata is None:
-                obj_list.append(None)
                 continue
 
             dtype = metadata.dtype
@@ -791,12 +790,12 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             assert shape is not None
             assert fmt is not None
 
-            obj = self.memory_allocator.allocate(shape, dtype, fmt)
-            assert obj is not None
+            obj_list[idx] = self.memory_allocator.allocate(shape, dtype, fmt)
+            if obj_list[idx] is None:
+                logger.warning("Failed to allocate memory, consider increasing the `nixl_buffer_size` value")
+                break
 
-            obj_list.append(obj)
-
-            mem_indices.append(obj.meta.address)
+            mem_indices.append(obj_list[idx].meta.address)
             storage_indices.append(metadata.index)
 
         if not mem_indices:
