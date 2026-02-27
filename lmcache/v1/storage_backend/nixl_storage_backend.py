@@ -70,6 +70,7 @@ class NixlStorageConfig:
     path: str
     use_hugepages: bool
     enable_prog_thread: bool
+    never_check_exists: bool
 
     @staticmethod
     def validate_nixl_backend(dynamic_storage: bool, backend: str, device: str):
@@ -108,6 +109,10 @@ class NixlStorageConfig:
         path = extra_config.get("nixl_path")
         use_hugepages = extra_config.get("nixl_use_hugepages", False)
         enable_prog_thread = extra_config.get("nixl_enable_prog_thread", True)
+        never_check_exists = extra_config.get("nixl_never_check_exists", False)
+
+        if never_check_exists:
+            assert enable_presence_cache, "enable_presence_cache must be True when never_check_exists is True"
 
         assert pool_size is not None
         assert backend is not None
@@ -147,6 +152,7 @@ class NixlStorageConfig:
             path=path,
             use_hugepages=use_hugepages,
             enable_prog_thread=enable_prog_thread,
+            never_check_exists=never_check_exists,
         )
 
 
@@ -990,7 +996,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
 
         self.async_mode = nixl_config.enable_async_put
         self.enable_presence_cache = nixl_config.enable_presence_cache
-
+        self.never_check_exists = nixl_config.never_check_exists
         # Presence cache to reduce remote contains checks
         self.hit_counter = 0
         self.total_counter = 0
@@ -1296,6 +1302,9 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         # Check presence cache before hitting remote storage if not prefetching
         if self._cache_contains(key.chunk_hash):
             return True
+
+        if self.never_check_exists:
+            return False
 
         xfer_state = self.key_exists(key)
         if xfer_state:
