@@ -109,6 +109,7 @@ class NixlStorageConfig:
     use_hugepages: bool
     enable_prog_thread: bool
     sync_mode: Optional[Any]  # nixl_thread_sync_t, None if unsupported
+    never_check_exists: bool
 
     @staticmethod
     def validate_nixl_backend(backend: str, device: str) -> bool:
@@ -187,6 +188,10 @@ class NixlStorageConfig:
                     f"in nixl_thread_sync_t."
                 )
             sync_mode = getattr(nixl_thread_sync_t, attr_name)
+        never_check_exists = extra_config.get("nixl_never_check_exists", False)
+
+        if never_check_exists:
+            assert enable_presence_cache, "enable_presence_cache must be True when never_check_exists is True"
 
         assert pool_size is not None
         assert backend is not None
@@ -245,6 +250,7 @@ class NixlStorageConfig:
             use_hugepages=use_hugepages,
             enable_prog_thread=enable_prog_thread,
             sync_mode=sync_mode,
+            never_check_exists=never_check_exists,
         )
 
 
@@ -1278,6 +1284,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
 
         self.async_mode = nixl_config.enable_async_put
         self.enable_presence_cache = nixl_config.enable_presence_cache
+        self.never_check_exists = nixl_config.never_check_exists
         self.path = nixl_config.path
         self.direct_io_flag = 0
         if nixl_config.use_direct_io:
@@ -1807,6 +1814,9 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         found, local_result = self._exists_in_put_tasks_or_cache(key)
         if found:
             return local_result
+
+        if self.never_check_exists:
+            return False
 
         xfer_state = self.key_exists(key)
         if xfer_state:
