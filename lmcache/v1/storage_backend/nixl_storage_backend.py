@@ -997,6 +997,11 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         self.async_mode = nixl_config.enable_async_put
         self.enable_presence_cache = nixl_config.enable_presence_cache
         self.never_check_exists = nixl_config.never_check_exists
+        if nixl_config.backend == "DOCA_KV":
+            # DOCA_KV needs keys to fit into 128 bits
+            self._format_object_key = self._format_object_key_b128
+        else:
+            self._format_object_key = self._format_object_key_url_safe
         # Presence cache to reduce remote contains checks
         self.hit_counter = 0
         self.total_counter = 0
@@ -1072,10 +1077,10 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             f"fmt: {self.meta_fmt}"
         )
 
-    def _format_object_key(self, key: CacheEngineKey) -> str:
+    def _format_object_key_b128(self, key: CacheEngineKey) -> str:
         """
         Generate object key name based on CacheEngineKey information.
-        Similar to s3_connector._format_safe_path()
+        This version aims to be under 128 bits (16 bytes) in size.
         """
         assert key.worker_id < 256
         world_size_minus_one = key.world_size - 1
@@ -1097,6 +1102,17 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         encoded_key = base64.b85encode(key_bytes).decode("utf-8")
         assert len(encoded_key) <= 16
         return encoded_key
+
+    def _format_object_key_url_safe(self, key: CacheEngineKey) -> str:
+        """
+        Generate object key name based on CacheEngineKey information.
+        Similar to s3_connector._format_safe_path()
+        """
+        key_str = key.to_string()
+        # Replace slashes with underscores to make it safe for object storage
+        flat_key_str = key_str.replace("/", "_").replace("@", "_")
+        # URL encode for safety
+        return url_quote(flat_key_str, safe="")
 
     def key_exists(self, key: CacheEngineKey) -> bool:
         if self.agent.mem_type == "OBJ":
