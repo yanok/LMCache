@@ -3,13 +3,13 @@ local_cpu: false
 
   #nixl_buffer_size: 1048576000
   #nixl_buffer_size: 5368709120
-nixl_buffer_size: 10737418240
+nixl_buffer_size: 21474836480
 nixl_buffer_device: cpu
 extra_config:
   enable_nixl_storage: true
   nixl_use_hugepages: true
   nixl_backend: DOCA_KV
-  nixl_pool_size: 256
+  nixl_pool_size: 524288
   nixl_backend_params:
     device_name: "/tmp/doca_kv_storage"
 

@@ -1,3 +1,5 @@
 chunk_size: 128
 local_cpu: true
-max_local_cpu_size: 512
+max_local_cpu_size: 256
+local_cpu_use_hugepages: true
+
