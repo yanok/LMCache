@@ -1037,6 +1037,9 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             nixl_config.enable_prog_thread,
         )
 
+        # only used for DOCA_KV backend
+        self.prefetched_chunks: dict[CacheEngineKey, MemoryObj] = {}
+
     def set_presence_cache(self, cache: PresenceCache) -> None:
         """Configure a custom cache policy for key presence tracking."""
         if self.enable_presence_cache:
@@ -1315,6 +1318,15 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             logger.debug(f"Key {key.chunk_hash:x} is in put tasks")
             return False
 
+        if self.agent.backend == "DOCA_KV":
+            if key in self.prefetched_chunks:
+                return True
+            obj = self.storage_to_mem([key], False)[0]
+            if obj is not None:
+                self.prefetched_chunks[key] = obj
+                return True
+            return False
+
         # Check presence cache before hitting remote storage if not prefetching
         if self._cache_contains(key.chunk_hash):
             return True
@@ -1327,6 +1339,41 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             self._cache_add(key.chunk_hash)
 
         return xfer_state
+
+    def batched_contains(self, keys: list[CacheEngineKey], pin: bool = False) -> int:
+        """
+        Check whether the keys are in the storage backend.
+
+        For now, this is a DOCA_KV specific implementation that prefetches existing KV chunks.
+        For other backends, we fall back to the implementation that does contains() sequentially.
+        This should probably be changes in the future.
+
+        :param List[CacheEngineKey] keys: The keys of the MemoryObj.
+
+        :param bool pin: Whether to pin the key.
+            If True, the corresponding KV cache will be
+            pinned in the storage backend.
+        """
+        if self.agent.backend != "DOCA_KV":
+            return super().batched_contains(keys, pin)
+        
+        if not keys:
+            return 0
+        
+        obj_list = self.storage_to_mem(keys, pin)
+        has_error = False
+        hit_chunks = len(keys)
+        for idx, obj in enumerate(obj_list):
+            if obj is not None:
+                if has_error:
+                    self.memory_allocator.free(obj)
+                else:
+                    self.prefetched_chunks[keys[idx]] = obj
+            elif not has_error:
+                has_error = True
+                hit_chunks = idx
+        logger.info(f"DOCA_KV batched_contains: hit {hit_chunks} chunks out of {len(keys)}")
+        return hit_chunks
 
     async def batched_async_contains(
         self,
@@ -1406,6 +1453,12 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
 
         :return: MemoryObj. None if the key does not exist.
         """
+        if self.agent.backend == "DOCA_KV":
+            obj = self.prefetched_chunks.get(key, None)
+            if obj is not None:
+                self.prefetched_chunks.pop(key)
+                return obj
+
         obj_list = self.storage_to_mem([key], False)
         return obj_list[0]
 
@@ -1421,6 +1474,13 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         if not keys:
             return []
 
+        if self.agent.backend == "DOCA_KV":
+            obj_list = [self.prefetched_chunks.get(key, None) for key in keys]
+            for key in keys:
+                if key in self.prefetched_chunks:
+                    self.prefetched_chunks.pop(key)
+            return obj_list
+
         obj_list = self.storage_to_mem(keys, False)
         return obj_list
 
@@ -1435,6 +1495,13 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         :param List[CacheEngineKey] keys: The keys of the MemoryObjs.
         :return: a list of memory objects.
         """
+        if self.agent.backend == "DOCA_KV":
+            obj_list = [self.prefetched_chunks.get(key, None) for key in keys]
+            for key in keys:
+                if key in self.prefetched_chunks:
+                    self.prefetched_chunks.pop(key)
+            return obj_list
+
         obj_list = self.storage_to_mem(keys, False)
         size = -1
         for i, obj in enumerate(obj_list):
