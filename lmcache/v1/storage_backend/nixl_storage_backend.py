@@ -808,8 +808,18 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             return obj_list
 
         handle = self.agent.get_storage_to_mem_handle(mem_indices, storage_indices)
-        self.agent.post_blocking(handle)
-        self.agent.release_handle(handle)
+        try:
+            self.agent.post_blocking(handle)
+        except nixlBind.nixlBackendError as exc:
+            logger.warning(f"NIXL transfer failed: {exc}")
+            statuses = self.agent.nixl_agent.get_xfer_error_list(handle)
+            for idx, status in enumerate(statuses):
+                if status != nixlBind.NIXL_SUCCESS:
+                    logger.warning(f"NIXL transfer failed for storage index {storage_indices[idx]}: {status}")
+                    self.memory_allocator.free(obj_list[idx])
+                    obj_list[idx] = None
+        finally:
+            self.agent.release_handle(handle)
 
         return obj_list
 
