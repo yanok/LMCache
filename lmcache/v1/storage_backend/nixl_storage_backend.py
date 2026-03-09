@@ -1090,28 +1090,16 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
     def _format_object_key_b128(self, key: CacheEngineKey) -> str:
         """
         Generate object key name based on CacheEngineKey information.
-        This version aims to be under 128 bits (16 bytes) in size.
+        This version return a hex string of the key. Hex string length is 32 bytes, so
+        the key itself is 128 bits (16 bytes).
+
+        This is currently only used for DOCA_KV backend.
+
+        We need to do hex encoding here and hex encoding here and hex decoding in the the
+        NIXL plugin, since the key is passed via NIXL metadata as a string.
         """
-        assert key.worker_id < 256
-        world_size_minus_one = key.world_size - 1
-        assert world_size_minus_one < 256
-        layer_id = key.layer_id if hasattr(key, "layer_id") else 0
-        assert layer_id < 256
-        # Keep it minimal, since there might be limits on the key length
-        # We definitely need the chunk hash and worker id, since the chunk hash is
-        # computed _before_ sharding, so there _will_ be same chunk hashes for different workers.
-        # World size is nice to have, so we don't get collisions when we decide to reshard.
-        # I'm not sure whether layer id is strictly necessary.
-        # TODO: Should we just hash it instead?
-        chunk_hash = key.chunk_hash
-        if chunk_hash < 0:
-            chunk_hash = chunk_hash & ((1 << 64) - 1)
-        import struct
-        key_bytes = struct.pack("<QBBB", chunk_hash, key.worker_id, world_size_minus_one, layer_id)
-        import base64
-        encoded_key = base64.b85encode(key_bytes).decode("utf-8")
-        assert len(encoded_key) <= 16
-        return encoded_key
+        import hashlib
+        return hashlib.sha256(key.to_string().encode("utf-8")).hexdigest()[:32]
 
     def _format_object_key_url_safe(self, key: CacheEngineKey) -> str:
         """
