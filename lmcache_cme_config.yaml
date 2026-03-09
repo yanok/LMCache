@@ -9,8 +9,8 @@ extra_config:
   enable_nixl_storage: true
   nixl_use_hugepages: true
   nixl_presence_cache: true
-  nixl_never_check_exists: true
-  nixl_enable_prog_thread: false
+  #nixl_never_check_exists: true
+  #nixl_enable_prog_thread: false
   nixl_pool_size: 0  # disable static object pool
   nixl_backend: DOCA_KV
   nixl_backend_params:
