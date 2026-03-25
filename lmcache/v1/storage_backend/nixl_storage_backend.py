@@ -31,6 +31,7 @@ from nixl._api import nixl_prepped_dlist_handle as NixlDlistHandle
 from nixl._api import nixl_xfer_handle as NixlXferHandle
 from nixl._api import (
     nixlBind,
+    nixl_thread_sync_t,
 )
 import torch
 
@@ -298,7 +299,8 @@ class NixlStorageAgent(ABC):
 
         self.backend = backend
         self.agent_name = "NixlAgent_" + str(uuid.uuid4())
-        nixl_conf = NixlAgentConfig(backends=[], enable_prog_thread=enable_prog_thread)
+        # TODO: make sync_mode configurable
+        nixl_conf = NixlAgentConfig(backends=[], enable_prog_thread=enable_prog_thread, sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT)
         self.nixl_agent = NixlAgent(self.agent_name, nixl_conf)
         self.nixl_agent.create_backend(backend, backend_params)
 
