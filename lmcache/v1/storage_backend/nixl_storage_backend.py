@@ -1178,8 +1178,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         try:
             self.agent.post_blocking(handle)
         except nixlBind.nixlBackendError as exc:
-            logger.warning(f"Batch Transfer failed: {exc}")
-            
+            logger.debug(f"Batch Transfer failed: {exc}")
+
             # TODO: we need to busy loop here, to get _all_ statuses
             # but for now, just get what we can
             statuses = self.agent.nixl_agent.get_xfer_error_list(handle)
