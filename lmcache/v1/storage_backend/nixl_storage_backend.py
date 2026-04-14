@@ -1148,6 +1148,9 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             if obj is None:
                 # free previous allocated objects
                 logger.warning("Failed to allocate memory")
+                check = self.memory_allocator.memcheck()
+                logger.info("memcheck returned ", check)
+                logger.info("prefetched_chunks length: ", len(self.prefetched_chunks))
                 for obj in obj_list:
                     obj.ref_count_down()
                 return [None] * len(keys)
