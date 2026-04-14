@@ -1149,8 +1149,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 # free previous allocated objects
                 logger.warning("Failed to allocate memory")
                 check = self.memory_allocator.memcheck()
-                logger.info("memcheck returned ", check)
-                logger.info("prefetched_chunks length: ", len(self.prefetched_chunks))
+                logger.info(f"memcheck returned {check}")
+                logger.info(f"prefetched_chunks length: {len(self.prefetched_chunks)}")
                 for obj in obj_list:
                     obj.ref_count_down()
                 return [None] * len(keys)
@@ -1365,18 +1365,20 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
 
         obj_list = self.storage_to_mem(keys, pin)
         has_error = False
-        hit_chunks = len(keys)
+        prefix_hit_chunks = len(keys)
+        hit_chunks = 0
         for idx, obj in enumerate(obj_list):
             if obj is not None:
+                hit_chunks += 1
                 if has_error:
                     obj.ref_count_down()
                 else:
                     self.prefetched_chunks[keys[idx]] = obj
             elif not has_error:
                 has_error = True
-                hit_chunks = idx
-        logger.info(f"DOCA_KV batched_contains: hit {hit_chunks} chunks out of {len(keys)}")
-        return hit_chunks
+                prefix_hit_chunks = idx
+        logger.info(f"DOCA_KV batched_contains: hit {hit_chunks} chunks out of {len(keys)}, using {prefix_hit_chunks} chunks prefix")
+        return prefix_hit_chunks
 
     async def batched_async_contains(
         self,
