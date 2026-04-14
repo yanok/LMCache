@@ -818,7 +818,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             for idx, status in enumerate(statuses):
                 if status != nixlBind.NIXL_SUCCESS:
                     logger.warning(f"NIXL transfer failed for storage index {storage_indices[idx]}: {status}")
-                    self.memory_allocator.free(obj_list[idx])
+                    obj_list[idx].ref_count_down()
                     obj_list[idx] = None
         finally:
             self.agent.release_handle(handle)
@@ -1149,7 +1149,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 # free previous allocated objects
                 logger.warning("Failed to allocate memory")
                 for obj in obj_list:
-                    self.memory_allocator.free(obj)
+                    obj.ref_count_down()
                 return [None] * len(keys)
 
             obj_list.append(obj)
@@ -1195,7 +1195,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 # If the key failed, mark it as not existing in the presence cache
                 self._cache_discard(key.chunk_hash)
                 obj = obj_list[i]
-                self.memory_allocator.free(obj)
+                obj.ref_count_down()
                 obj_list[i] = None
         return obj_list
 
@@ -1356,17 +1356,17 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         """
         if self.agent.backend != "DOCA_KV":
             return super().batched_contains(keys, pin)
-        
+
         if not keys:
             return 0
-        
+
         obj_list = self.storage_to_mem(keys, pin)
         has_error = False
         hit_chunks = len(keys)
         for idx, obj in enumerate(obj_list):
             if obj is not None:
                 if has_error:
-                    self.memory_allocator.free(obj)
+                    obj.ref_count_down()
                 else:
                     self.prefetched_chunks[keys[idx]] = obj
             elif not has_error:
