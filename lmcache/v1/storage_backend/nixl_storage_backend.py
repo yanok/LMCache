@@ -56,6 +56,68 @@ from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
 logger = init_logger(__name__)
 
+# Wrapper class for the dictionary of prefetched chunks.
+# The idea is to have two dictionaries, chunks0 and chunks1.
+# chunks0 is the active dictionary, where we add new chunks.
+# And chunks1 is the inactive dictionary, we use it for getting chunks,
+# but never insert new chunks into it.
+# After user specified time passed, we demote the dictionaries.
+# chunks0 becomes chunks1, and chunks1 becomes chunks_to_collect.
+# We also initialize chunks0 with the empty dictionary.
+# Then we can collect the chunks in chunks_to_collect by calling ref_count_down() on
+# each MemoryObj.
+# get() also removes the fetched chunk from the corresponding dictionary.
+# This is a thread-safe implementation.
+class PrefetchedChunks:
+    def __init__(self, time_to_demote: float, loop: asyncio.AbstractEventLoop):
+        self.chunks0: dict[CacheEngineKey, MemoryObj] = {}
+        self.chunks1: dict[CacheEngineKey, MemoryObj] = {}
+        self.lock = threading.RLock()
+        self.time_to_demote = time_to_demote
+        self.loop = loop
+        self.future = asyncio.run_coroutine_threadsafe(self.demote_chunks(), self.loop)
+
+    def add(self, key: CacheEngineKey, obj: MemoryObj):
+        with self.lock:
+            if key in self.chunks0:
+                logger.warning(f"Key {key} already in chunks0, do nothing")
+                obj.ref_count_down()
+                return
+            if key in self.chunks1:
+                logger.warning(f"Key {key} already in chunks1, promote to chunks0")
+                self.chunks0[key] = self.chunks1.pop(key)
+                obj.ref_count_down()
+                return
+            self.chunks0[key] = obj
+
+    async def demote_chunks(self):
+        while True:
+            await asyncio.sleep(self.time_to_demote)
+            with self.lock:
+                self.chunks1, chunks_to_collect = self.chunks0, self.chunks1
+                self.chunks0 = {}
+            if len(chunks_to_collect) > 0:
+                logger.info(f"Collecting {len(chunks_to_collect)} unclaimed chunks")
+                for chunk in chunks_to_collect.values():
+                    chunk.ref_count_down()
+
+    def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        chunk = None
+        with self.lock:
+            chunk = self.chunks0.get(key, None)
+            if chunk is not None:
+                self.chunks0.pop(key)
+                return chunk
+            chunk = self.chunks1.get(key, None)
+            if chunk is not None:
+                self.chunks1.pop(key)
+                return chunk
+        return None
+    
+    def contains(self, key: CacheEngineKey) -> bool:
+        with self.lock:
+            return key in self.chunks0 or key in self.chunks1
+
 
 @dataclass
 class NixlStorageConfig:
@@ -72,6 +134,7 @@ class NixlStorageConfig:
     use_hugepages: bool
     enable_prog_thread: bool
     never_check_exists: bool
+    time_to_demote: float
 
     @staticmethod
     def validate_nixl_backend(dynamic_storage: bool, backend: str, device: str):
@@ -111,6 +174,7 @@ class NixlStorageConfig:
         use_hugepages = extra_config.get("nixl_use_hugepages", False)
         enable_prog_thread = extra_config.get("nixl_enable_prog_thread", True)
         never_check_exists = extra_config.get("nixl_never_check_exists", False)
+        time_to_demote = extra_config.get("nixl_time_to_demote", 30.0)
 
         if never_check_exists:
             assert enable_presence_cache, "enable_presence_cache must be True when never_check_exists is True"
@@ -154,6 +218,7 @@ class NixlStorageConfig:
             use_hugepages=use_hugepages,
             enable_prog_thread=enable_prog_thread,
             never_check_exists=never_check_exists,
+            time_to_demote=time_to_demote,
         )
 
 
@@ -1038,7 +1103,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         )
 
         # only used for DOCA_KV backend
-        self.prefetched_chunks: dict[CacheEngineKey, MemoryObj] = {}
+        self.prefetched_chunks = PrefetchedChunks(time_to_demote=nixl_config.time_to_demote, loop=loop)
 
     def set_presence_cache(self, cache: PresenceCache) -> None:
         """Configure a custom cache policy for key presence tracking."""
@@ -1150,7 +1215,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 logger.warning("Failed to allocate memory")
                 check = self.memory_allocator.memcheck()
                 logger.info(f"memcheck returned {check}")
-                logger.info(f"prefetched_chunks length: {len(self.prefetched_chunks)}")
+                logger.info(f"prefetched_chunks length: {len(self.prefetched_chunks.chunks0) + len(self.prefetched_chunks.chunks1)}")
                 for obj in obj_list:
                     obj.ref_count_down()
                 return [None] * len(keys)
@@ -1322,11 +1387,11 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             return False
 
         if self.agent.backend == "DOCA_KV":
-            if key in self.prefetched_chunks:
+            if self.prefetched_chunks.contains(key):
                 return True
             obj = self.storage_to_mem([key], False)[0]
             if obj is not None:
-                self.prefetched_chunks[key] = obj
+                self.prefetched_chunks.add(key, obj)
                 return True
             return False
 
@@ -1370,10 +1435,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         for idx, obj in enumerate(obj_list):
             if obj is not None:
                 hit_chunks += 1
-                if has_error:
-                    obj.ref_count_down()
-                else:
-                    self.prefetched_chunks[keys[idx]] = obj
+                self.prefetched_chunks.add(keys[idx], obj)
             elif not has_error:
                 has_error = True
                 prefix_hit_chunks = idx
@@ -1459,9 +1521,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         :return: MemoryObj. None if the key does not exist.
         """
         if self.agent.backend == "DOCA_KV":
-            obj = self.prefetched_chunks.get(key, None)
+            obj = self.prefetched_chunks.get(key)
             if obj is not None:
-                self.prefetched_chunks.pop(key)
                 return obj
 
         obj_list = self.storage_to_mem([key], False)
@@ -1480,10 +1541,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             return []
 
         if self.agent.backend == "DOCA_KV":
-            obj_list = [self.prefetched_chunks.get(key, None) for key in keys]
-            for key in keys:
-                if key in self.prefetched_chunks:
-                    self.prefetched_chunks.pop(key)
+            obj_list = [self.prefetched_chunks.get(key) for key in keys]
             return obj_list
 
         obj_list = self.storage_to_mem(keys, False)
@@ -1501,10 +1559,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         :return: a list of memory objects.
         """
         if self.agent.backend == "DOCA_KV":
-            obj_list = [self.prefetched_chunks.get(key, None) for key in keys]
-            for key in keys:
-                if key in self.prefetched_chunks:
-                    self.prefetched_chunks.pop(key)
+            obj_list = [self.prefetched_chunks.get(key) for key in keys]
             return obj_list
 
         obj_list = self.storage_to_mem(keys, False)
