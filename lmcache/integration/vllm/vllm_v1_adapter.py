@@ -1471,6 +1471,34 @@ class LMCacheConnectorV1Impl:
 
         return need_to_allocate
 
+    def get_computed_token_gaps(
+        self,
+        request: "Request",
+    ) -> "list[tuple[int, int]] | None":
+        """
+        Return cached gap intervals for the given request, or None if unknown.
+
+        The scheduler calls this after get_num_new_matched_tokens() to discover
+        which chunks in the request's hit range are missing and need recompute
+        via virtual requests.
+
+        Returns None when no gap data exists for the request (request unknown
+        or lookup returned prefix-only result). Returns [] when data exists but
+        no gaps were found (contiguous hit).
+        """
+        gaps = self._req_to_gaps.get(request.request_id)
+        if gaps:
+            gap_tokens = sum(e - s for s, e in gaps)
+            logger.debug(
+                "get_computed_token_gaps: reqid=%s gaps=%s total_gap_tokens=%d "
+                "(scheduler will create %d virtual request(s))",
+                request.request_id,
+                gaps,
+                gap_tokens,
+                len(gaps),
+            )
+        return gaps
+
     @_lmcache_nvtx_annotate
     def update_state_after_alloc(self, request: "Request", num_external_tokens: int):
         """
