@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import abc
 import asyncio
 
@@ -345,6 +345,23 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         :return: Return hit chunks by prefix match.
         """
         raise NotImplementedError
+
+    def batched_contains_gaps(
+        self,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+    ) -> Optional[Tuple[List[Tuple[int, int]], int]]:
+        """
+        Check key presence with gap reporting.
+
+        Returns None by default. Override in connectors that support
+        gap reporting (e.g., DOCA_KV).
+
+        :param List[CacheEngineKey] keys: The keys to check.
+        :param bool pin: Whether to pin the hit keys.
+        :return: (gaps, end) or None if not supported.
+        """
+        return None
 
     def support_batched_contains(self) -> bool:
         """

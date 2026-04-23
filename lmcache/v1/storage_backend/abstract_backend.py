@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple, Union
 import abc
 import asyncio
 
@@ -290,6 +290,34 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
                 break
             hit_chunks += 1
         return hit_chunks
+
+    def batched_contains_gaps(
+        self,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+    ) -> Optional[Tuple[List[Tuple[int, int]], int]]:
+        """
+        Check key presence with gap reporting.
+
+        Returns None by default — this backend does not support gap
+        reporting and the caller should fall back to batched_contains()
+        prefix-only behavior.
+
+        Backends that override this return (gaps, end) where:
+          - gaps: sorted, non-overlapping half-open intervals [start, end)
+            of absent keys within [0, end). Trailing misses are included
+            as a gap (e.g., keys[0,1] present, keys[2,3,4] absent returns
+            ([(2,5)], 5)).
+          - end: how many keys this backend covers. Normally len(keys);
+            may be less if the backend signals truncation (the suffix
+            cascades to the next tier, same as current behavior).
+        Positions in [0, end) not in any gap are hits.
+
+        :param List[CacheEngineKey] keys: The keys to check.
+        :param bool pin: Whether to pin the hit keys.
+        :return: (gaps, end) or None if not supported.
+        """
+        return None
 
     def touch_cache(self) -> None:
         """
