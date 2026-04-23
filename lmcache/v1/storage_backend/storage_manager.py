@@ -212,6 +212,21 @@ class AsyncSingleSerializer:
 AsyncSerializer = Union[AsyncSingleSerializer, AsyncMultiSerializer]
 
 
+def _furthest_hit_from_gaps(
+    gaps: List[Tuple[int, int]], end: int
+) -> int:
+    """Position-after-last-hit in [0, end) given a sorted gap list.
+
+    Returns 0 if all positions are in gaps (no hits).
+    """
+    if not gaps:
+        return end
+    last_gap_start, last_gap_end = gaps[-1]
+    if last_gap_end == end:
+        return last_gap_start
+    return end
+
+
 # TODO: extend this class to implement caching policies and eviction policies
 class StorageManager:
     """
@@ -951,6 +966,94 @@ class StorageManager:
             keys = keys[hit_chunks:]
 
         return total_hit_chunks, block_mapping
+
+    def batched_contains_with_gaps(
+        self,
+        keys: List[CacheEngineKey],
+        search_range: Optional[List[str]] = None,
+        pin: bool = False,
+    ) -> Tuple[int, List[Tuple[int, int]], dict]:
+        """
+        Check key existence across backends, reporting gap intervals.
+
+        Unlike batched_contains() which only reports a prefix count,
+        this method reports the furthest hit extent and the chunk-index
+        gap intervals within that extent.
+
+        When a backend does not support gap reporting
+        (batched_contains_gaps() returns None), falls back to
+        batched_contains() prefix-only behavior for that tier.
+
+        :param List[CacheEngineKey] keys: The keys to check.
+        :param Optional[List[str]] search_range: Backend filter.
+        :param bool pin: Whether to pin hit keys.
+
+        :return: (furthest_hit_end, chunk_gaps, block_mapping) where:
+            - furthest_hit_end: position after the last hit key (0 if
+              no hits).
+            - chunk_gaps: chunk-index half-open gap intervals within
+              [0, furthest_hit_end). Trailing absences are stripped.
+            - block_mapping: {backend_name: [hit_keys]}.
+        """
+        total_keys = len(keys)
+        if total_keys == 0:
+            return 0, [], {}
+
+        chunk_gaps: List[Tuple[int, int]] = []
+        block_mapping: dict = {}
+        offset = 0
+        furthest_hit_end = 0
+
+        for backend_name, backend in self.get_active_storage_backends(
+            search_range=search_range
+        ):
+            remaining = total_keys - offset
+            if remaining <= 0:
+                break
+
+            pin_in_backend = pin if backend_name != "PDBackend" else False
+            remaining_keys = keys[offset:]
+
+            result = backend.batched_contains_gaps(remaining_keys, pin_in_backend)
+
+            if result is not None:
+                gaps_relative, end = result
+
+                tier_furthest = _furthest_hit_from_gaps(gaps_relative, end)
+                abs_furthest = offset + tier_furthest
+                furthest_hit_end = max(furthest_hit_end, abs_furthest)
+
+                for s, e in gaps_relative:
+                    abs_s = offset + s
+                    abs_e = offset + min(e, tier_furthest)
+                    if abs_s < offset + tier_furthest:
+                        chunk_gaps.append((abs_s, abs_e))
+
+                hit_keys: List[CacheEngineKey] = []
+                pos = 0
+                for s, e in gaps_relative:
+                    hit_keys.extend(remaining_keys[pos:s])
+                    pos = e
+                hit_keys.extend(remaining_keys[pos:end])
+                if hit_keys:
+                    block_mapping[backend_name] = hit_keys
+
+                offset += end
+
+            else:
+                # Prefix-only fallback — same as existing batched_contains
+                hit_chunks = backend.batched_contains(remaining_keys, pin_in_backend)
+
+                if hit_chunks > 0:
+                    block_mapping[backend_name] = remaining_keys[:hit_chunks]
+                    abs_furthest = offset + hit_chunks
+                    furthest_hit_end = max(furthest_hit_end, abs_furthest)
+                    offset += hit_chunks
+
+            if offset >= total_keys:
+                break
+
+        return furthest_hit_end, chunk_gaps, block_mapping
 
     def get_block_mapping(
         self, chunk_infos: List[Tuple[CacheEngineKey, int, int]]
