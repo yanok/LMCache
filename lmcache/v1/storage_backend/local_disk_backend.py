@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple
 import asyncio
 import os
 import threading
@@ -111,6 +111,7 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             super().__init__("cpu")
 
+        self.config = config
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.dict = self.cache_policy.init_mutable_mapping()
 
@@ -199,6 +200,55 @@ class LocalDiskBackend(StorageBackendInterface):
                 # vllm lookup sets pin to True
                 self.keys_in_request.append(key)
             return True
+
+    def batched_contains_gaps(
+        self,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+    ) -> Tuple[List[Tuple[int, int]], int]:
+        """Check all keys for presence, returning gap intervals.
+
+        Overrides the base class default (None) to opt this backend into
+        gap reporting for segmented prefill.
+
+        Absent keys within the hit range are merged into contiguous
+        half-open gap intervals. Trailing misses after the last hit are
+        NOT included: end equals last_hit_end, allowing the storage
+        manager to cascade remaining keys to the next tier (e.g.,
+        keys[0,1] present, keys[2,3,4] absent returns ([], 2)).
+
+        Pin is applied only to present keys.
+
+        :param List[CacheEngineKey] keys: Keys to check.
+        :param bool pin: Whether to pin present keys.
+        :return: (gaps, end) where end == last_hit_end (0 if no hits).
+        """
+        with self.disk_lock:
+            gaps: List[Tuple[int, int]] = []
+            in_gap = False
+            gap_start = 0
+            last_hit_end = 0
+            for i, key in enumerate(keys):
+                present = key in self.dict
+                if present:
+                    if in_gap:
+                        gaps.append((gap_start, i))
+                        in_gap = False
+                    last_hit_end = i + 1
+                    if pin:
+                        self.dict[key].pin()
+                        self.keys_in_request.append(key)
+                else:
+                    if not in_gap:
+                        gap_start = i
+                        in_gap = True
+            # Trailing misses are not appended — they cascade to the next tier
+
+        logger.debug(
+            "batched_contains_gaps: gaps=%s end=%d (out of %d keys)",
+            gaps, last_hit_end, len(keys),
+        )
+        return (gaps, last_hit_end)
 
     def touch_cache(self):
         # flip the order of the keys in the request
