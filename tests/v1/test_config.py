@@ -715,3 +715,84 @@ def test_update_config_from_env_calls_validate():
         del os.environ["LMCACHE_PD_BUFFER_SIZE"]
         del os.environ["LMCACHE_PD_BUFFER_DEVICE"]
         del os.environ["LMCACHE_SAVE_UNFULL_CHUNK"]
+
+
+class TestInjectionConfigFields:
+    """Verify gap injection config fields exist with correct defaults.
+
+    Verifies these fields are mutable and properly configured.
+    """
+
+    def test_cpu_gap_rate_default(self):
+        config = LMCacheEngineConfig.from_defaults()
+        assert config.cpu_gap_rate == 0.0
+
+    def test_cpu_gap_count_default(self):
+        config = LMCacheEngineConfig.from_defaults()
+        assert config.cpu_gap_count == 0
+
+    def test_disk_gap_rate_default(self):
+        config = LMCacheEngineConfig.from_defaults()
+        assert config.disk_gap_rate == 0.0
+
+    def test_disk_gap_count_default(self):
+        config = LMCacheEngineConfig.from_defaults()
+        assert config.disk_gap_count == 0
+
+    def test_cpu_gap_rate_from_defaults_kwarg(self):
+        config = LMCacheEngineConfig.from_defaults(cpu_gap_rate=0.5)
+        assert config.cpu_gap_rate == 0.5
+
+    def test_cpu_gap_count_from_defaults_kwarg(self):
+        config = LMCacheEngineConfig.from_defaults(cpu_gap_count=3)
+        assert config.cpu_gap_count == 3
+
+    def test_disk_gap_rate_from_defaults_kwarg(self):
+        config = LMCacheEngineConfig.from_defaults(disk_gap_rate=0.25)
+        assert config.disk_gap_rate == 0.25
+
+    def test_disk_gap_count_from_defaults_kwarg(self):
+        config = LMCacheEngineConfig.from_defaults(disk_gap_count=2)
+        assert config.disk_gap_count == 2
+
+    def test_cpu_gap_rate_mutable_via_validate_and_set(self):
+        config = LMCacheEngineConfig.from_defaults()
+        result = validate_and_set_config_value(config, "cpu_gap_rate", 0.7)
+        assert result is True
+        assert config.cpu_gap_rate == 0.7
+
+    def test_cpu_gap_count_mutable_via_validate_and_set(self):
+        config = LMCacheEngineConfig.from_defaults()
+        result = validate_and_set_config_value(config, "cpu_gap_count", 5)
+        assert result is True
+        assert config.cpu_gap_count == 5
+
+    def test_disk_gap_rate_mutable_via_validate_and_set(self):
+        config = LMCacheEngineConfig.from_defaults()
+        result = validate_and_set_config_value(config, "disk_gap_rate", 0.3)
+        assert result is True
+        assert config.disk_gap_rate == 0.3
+
+    def test_disk_gap_count_mutable_via_validate_and_set(self):
+        config = LMCacheEngineConfig.from_defaults()
+        result = validate_and_set_config_value(config, "disk_gap_count", 4)
+        assert result is True
+        assert config.disk_gap_count == 4
+
+    def test_injection_fields_are_marked_mutable(self):
+        from lmcache.v1.config import _CONFIG_DEFINITIONS
+        fields = ("cpu_gap_rate", "cpu_gap_count", "disk_gap_rate",
+                  "disk_gap_count")
+        for field in fields:
+            assert _CONFIG_DEFINITIONS[field].get("mutable") is True, (
+                f"{field} must have mutable=True"
+            )
+
+    def test_injection_fields_pass_endpoint_mutable_check(self):
+        from lmcache.v1.internal_api_server.vllm.conf_api import _is_mutable_config
+        fields = ("cpu_gap_rate", "cpu_gap_count", "disk_gap_rate",
+                  "disk_gap_count")
+        for field in fields:
+            assert _is_mutable_config(field) is True, (
+                f"{field} should be mutable via /conf endpoint"
+            )
