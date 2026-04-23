@@ -522,6 +522,11 @@ class LMCacheConnectorV1Impl:
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
             self._unfinished_requests: dict[str, "Request"] = {}
+            # Per-request gap intervals from lookup_with_gaps().
+            # Populated in get_num_new_matched_tokens(), read in
+            # get_computed_token_gaps(), cleared for finished requests
+            # in build_connector_meta().
+            self._req_to_gaps: dict[str, list[tuple[int, int]]] = {}
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
@@ -1283,11 +1288,16 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
-            num_external_hit_tokens = self.lookup_client.lookup(
+            lookup_result = self.lookup_client.lookup_with_gaps(
                 token_ids,
                 lookup_id=req_id,
                 request_configs=request_configs,
             )
+            if lookup_result is None:
+                num_external_hit_tokens = None
+            else:
+                num_external_hit_tokens, gaps = lookup_result
+                self._req_to_gaps[req_id] = gaps
 
         if num_external_hit_tokens is None:
             logger.debug(
@@ -1328,20 +1338,25 @@ class LMCacheConnectorV1Impl:
                 min_retrieve,
             )
         else:
+            gaps = self._req_to_gaps.get(req_id, [])
+            gap_tokens = sum(e - s for s, e in gaps)
             logger.info(
                 "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
-                "LMCache hit tokens: %d, need to load: %d",
+                "LMCache hit tokens: %d, need to load: %d, gaps: %d (%d tokens)",
                 req_id,
                 request.num_tokens,
                 num_computed_tokens,
                 num_external_hit_tokens,
                 max(need_to_allocate, 0),
+                len(gaps),
+                gap_tokens,
             )
 
         self.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
+            gaps=self._req_to_gaps.get(req_id, []),
         )
 
         if below_min_retrieve or need_to_allocate <= 0:
