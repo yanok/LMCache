@@ -394,10 +394,14 @@ from unittest.mock import MagicMock, patch  # noqa: E402
 def _make_backend_cpu(
     temp_disk_path,
     async_loop,
+    disk_gap_rate: float = 0.0,
+    disk_gap_count: int = 0,
 ) -> "LocalDiskBackend":
     """Create a LocalDiskBackend with cpu device (no CUDA needed)."""
     config = create_test_config(
         temp_disk_path,
+        disk_gap_rate=disk_gap_rate,
+        disk_gap_count=disk_gap_count,
     )
     cpu_config = LMCacheEngineConfig.from_legacy(chunk_size=256)
     from lmcache.v1.memory_management import AdHocMemoryAllocator
@@ -483,4 +487,150 @@ class TestBatchedContainsGaps:
         gaps, end = backend.batched_contains_gaps(keys, pin=True)
         for obj in mock_objs:
             obj.pin.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # Fault injection via disk_gap_rate
+    # ------------------------------------------------------------------
+
+    def test_gap_rate_zero_no_faults(self, temp_disk_path, async_loop):
+        backend = _make_backend_cpu(temp_disk_path, async_loop, disk_gap_rate=0.0)
+        keys = [create_test_key(i) for i in range(3)]
+        _inject_keys(backend, keys)
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == []
+        assert end == 3
+
+    def test_gap_rate_one_all_hits_become_gaps(self, temp_disk_path, async_loop):
+        """disk_gap_rate=1.0 -> every real hit is suppressed; end=0."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop, disk_gap_rate=1.0)
+        keys = [create_test_key(i) for i in range(3)]
+        _inject_keys(backend, keys)
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == []
+        assert end == 0
+
+    def test_gap_rate_one_real_misses_unaffected(self, temp_disk_path, async_loop):
+        """Real misses are unaffected by fault injection -> end=0."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop, disk_gap_rate=1.0)
+        keys = [create_test_key(i) for i in range(3)]
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == []
+        assert end == 0
+
+    def test_gap_rate_partial_uses_random(self, temp_disk_path, async_loop):
+        """disk_gap_rate=0.5: mock random to control which hits flip."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop, disk_gap_rate=0.5)
+        keys = [create_test_key(i) for i in range(4)]
+        _inject_keys(backend, keys)
+
+        # 0.3 < 0.5 -> flip (gap), 0.7 >= 0.5 -> keep (hit)
+        with patch(
+            "lmcache.v1.storage_backend.local_disk_backend.random.random",
+            side_effect=[0.3, 0.7, 0.3, 0.7],
+        ):
+            gaps, end = backend.batched_contains_gaps(keys)
+
+        assert gaps == [(0, 1), (2, 3)]
+        assert end == 4
+
+    def test_gap_rate_not_applied_to_real_misses(self, temp_disk_path, async_loop):
+        """random.random is NOT called for absent keys."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop, disk_gap_rate=0.5)
+        keys = [create_test_key(i) for i in range(3)]
+        _inject_keys(backend, [keys[0]])
+
+        call_count = [0]
+
+        def counting_random():
+            call_count[0] += 1
+            return 0.9
+
+        with patch(
+            "lmcache.v1.storage_backend.local_disk_backend.random.random",
+            side_effect=counting_random,
+        ):
+            gaps, end = backend.batched_contains_gaps(keys)
+
+        assert call_count[0] == 1
+        assert gaps == []
+        assert end == 1
+
+    def test_fault_injected_keys_not_pinned(self, temp_disk_path, async_loop):
+        """Keys reported as gaps are never pinned, even if really present."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop, disk_gap_rate=1.0)
+        keys = [create_test_key(i) for i in range(2)]
+        mock_objs = [MagicMock(), MagicMock()]
+        for key, obj in zip(keys, mock_objs):
+            backend.dict[key] = obj
+
+        backend.batched_contains_gaps(keys, pin=True)
+        for obj in mock_objs:
+            obj.pin.assert_not_called()
+
+
+class TestBatchedContainsGapsDiskRuntimeMutation:
+    """Verify injection params are read from self.config at call time (runtime-mutable)."""
+
+    def test_gap_rate_mutable_at_runtime(self, temp_disk_path, async_loop):
+        """Mutating config.disk_gap_rate between calls changes injection behavior."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop)
+        keys = [create_test_key(i) for i in range(4)]
+        _inject_keys(backend, keys)
+
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == [] and end == 4
+
+        backend.config.disk_gap_rate = 1.0
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert end == 0
+
+        backend.config.disk_gap_rate = 0.0
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == [] and end == 4
+
+    def test_gap_count_mutable_at_runtime(self, temp_disk_path, async_loop):
+        """Mutating config.disk_gap_count between calls changes injection behavior."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop)
+        keys = [create_test_key(i) for i in range(6)]
+        _inject_keys(backend, keys)
+
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == [] and end == 6
+
+        backend.config.disk_gap_count = 2
+        with patch(
+            "lmcache.v1.storage_backend.local_disk_backend.random.sample",
+            return_value=[1, 3],
+        ):
+            gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == [(1, 2), (3, 4)] and end == 6
+
+        backend.config.disk_gap_count = 0
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == [] and end == 6
+
+    def test_gap_count_threshold_not_met(self, temp_disk_path, async_loop):
+        """count mode is skipped when len(keys) < 2 * gap_count."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop, disk_gap_count=3)
+        keys = [create_test_key(i) for i in range(5)]
+        _inject_keys(backend, keys)
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == [] and end == 5
+
+    def test_gap_count_takes_precedence_over_rate(self, temp_disk_path, async_loop):
+        """When both count and rate are non-zero, count mode wins."""
+        backend = _make_backend_cpu(
+            temp_disk_path, async_loop, disk_gap_rate=1.0, disk_gap_count=2
+        )
+        keys = [create_test_key(i) for i in range(6)]
+        _inject_keys(backend, keys)
+        with patch(
+            "lmcache.v1.storage_backend.local_disk_backend.random.sample",
+            return_value=[0, 2],
+        ) as mock_sample, patch(
+            "lmcache.v1.storage_backend.local_disk_backend.random.random"
+        ) as mock_random:
+            backend.batched_contains_gaps(keys)
+        mock_sample.assert_called_once()
+        mock_random.assert_not_called()
 
