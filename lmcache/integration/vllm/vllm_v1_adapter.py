@@ -1557,6 +1557,24 @@ class LMCacheConnectorV1Impl:
             # Ignore DP attention mock requests
             if request.req_id.startswith("mock_req"):
                 continue
+
+            # Skip virtual requests created by the segmented-prefill scheduler
+            # for gap chunks. Virtual IDs look like "<parent_id>.<gap_start>"
+            # (e.g., "chatcmpl-abc.256"). Two-condition guard:
+            # 1. The ID contains a dot separator
+            # 2. The part before the dot is an existing parent request tracker
+            # Both conditions must hold to avoid misclassifying real IDs with dots.
+            # NOTE: This filter relies on the scheduler placing the parent
+            # request before its virtual children in scheduled_new_reqs.
+            # The vLLM segmented-prefill scheduler guarantees this:
+            # _handle_segmented_prefill() appends virtual entries after the
+            # parent in the same list, so the parent tracker is registered
+            # (in the loop body below) before any virtual child is processed.
+            if "." in request.req_id:
+                parent_id = request.req_id.rsplit(".", 1)[0]
+                if parent_id in self._request_trackers:
+                    continue
+
             load_spec = self.load_specs.pop(request.req_id, None)
             num_tokens_to_compute = (
                 request.num_computed_tokens
