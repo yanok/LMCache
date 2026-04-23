@@ -4,6 +4,7 @@ from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple
 import asyncio
 import os
+import random
 import threading
 import time
 
@@ -211,26 +212,60 @@ class LocalDiskBackend(StorageBackendInterface):
         Overrides the base class default (None) to opt this backend into
         gap reporting for segmented prefill.
 
-        Absent keys within the hit range are merged into contiguous
-        half-open gap intervals. Trailing misses after the last hit are
-        NOT included: end equals last_hit_end, allowing the storage
-        manager to cascade remaining keys to the next tier (e.g.,
-        keys[0,1] present, keys[2,3,4] absent returns ([], 2)).
+        Two mutually exclusive fault-injection modes are supported, both
+        read from self.config and mutable at runtime via the /conf endpoint:
 
-        Pin is applied only to present keys.
+        config.disk_gap_count (int): inject exactly this many failures.
+        Only activates when len(keys) >= 2 * gap_count and at least
+        gap_count real hits are present; otherwise no injection occurs.
+        Takes precedence over disk_gap_rate when both are non-zero and
+        len(keys) >= 2 * gap_count. If the threshold is not met,
+        disk_gap_rate applies instead.
+
+        config.disk_gap_rate (float in [0.0, 1.0]): each real cache hit
+        is independently flipped to a reported miss with that probability.
+
+        Absent keys — whether real or fault-injected — within the hit
+        range are merged into contiguous half-open gap intervals.
+        Trailing misses after the last hit are NOT included: end equals
+        last_hit_end, allowing the storage manager to cascade remaining
+        keys to the next tier (e.g., keys[0,1] present, keys[2,3,4]
+        absent in a 5-key list returns ([], 2)).
+
+        Pin is applied only to keys reported as present (after fault
+        injection), so pinned keys are never reported as gaps.
 
         :param List[CacheEngineKey] keys: Keys to check.
-        :param bool pin: Whether to pin present keys.
+        :param bool pin: Whether to pin reported-present keys.
         :return: (gaps, end) where end == last_hit_end (0 if no hits).
         """
+        gap_rate = self.config.disk_gap_rate
+        gap_count = self.config.disk_gap_count
+
         with self.disk_lock:
+            injected_indices: set = set()
+            if gap_count > 0 and len(keys) >= 2 * gap_count:
+                real_hit_indices = [
+                    i for i, key in enumerate(keys) if key in self.dict
+                ]
+                if len(real_hit_indices) >= gap_count:
+                    injected_indices = set(
+                        random.sample(real_hit_indices, gap_count)
+                    )
+            elif gap_rate > 0.0:
+                injected_indices = {
+                    i for i, key in enumerate(keys)
+                    if key in self.dict and random.random() < gap_rate
+                }
+
             gaps: List[Tuple[int, int]] = []
             in_gap = False
             gap_start = 0
             last_hit_end = 0
             for i, key in enumerate(keys):
-                present = key in self.dict
-                if present:
+                real_present = key in self.dict
+                reported_present = real_present and i not in injected_indices
+                if reported_present:
                     if in_gap:
                         gaps.append((gap_start, i))
                         in_gap = False
@@ -244,6 +279,11 @@ class LocalDiskBackend(StorageBackendInterface):
                         in_gap = True
             # Trailing misses are not appended — they cascade to the next tier
 
+        if injected_indices:
+            logger.warning(
+                "Injected %d failure(s); reported gaps: %s",
+                len(injected_indices), gaps,
+            )
         logger.debug(
             "batched_contains_gaps: gaps=%s end=%d (out of %d keys)",
             gaps, last_hit_end, len(keys),
