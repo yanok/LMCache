@@ -1177,6 +1177,120 @@ class LMCacheEngine:
                 self.storage_manager.touch_cache()
 
     @_lmcache_nvtx_annotate
+    def lookup_with_gaps(
+        self,
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
+        search_range: Optional[List[str]] = None,
+        lookup_id: Optional[str] = None,
+        pin: bool = False,
+        request_configs: Optional[dict] = None,
+    ) -> tuple[int, list[tuple[int, int]]]:
+        """
+        Gap-aware variant of lookup(). Returns hit extent and gap intervals.
+
+        :param Optional[Union[torch.Tensor, List[int]]] tokens: input tokens
+        :param Optional[List[int]] hashes: chunk hashes
+        :param Optional[List[int]] offsets: chunk offsets (sizes)
+        :param Optional[List[str]] search_range: backend filter
+        :param Optional[str] lookup_id: required when pin=True
+        :param bool pin: pin hit KV in storage
+        :param Optional[dict] request_configs: per-request configs
+
+        :return: (furthest_hit_tokens, gap_intervals)
+            furthest_hit_tokens: end token position of the furthest hit
+                chunk. 0 if no hits.
+            gap_intervals: list of (start_token, end_token) half-open
+                intervals for gap chunks within [0, furthest_hit_tokens).
+                Empty when no gaps or no hits.
+        """
+        if not self.is_healthy():
+            logger.warning("LMCache is unhealthy, skipping lookup_with_gaps operation")
+            return 0, []
+
+        assert self.storage_manager is not None
+
+        if tokens is not None:
+            lookup_stats = self.stats_monitor.on_lookup_request(len(tokens))
+        else:
+            assert offsets is not None
+            assert hashes is not None
+            lookup_stats = self.stats_monitor.on_lookup_request(sum(offsets))
+
+        if search_range is None:
+            search_range = self.retrieve_locations
+
+        res = 0
+        gaps: list[tuple[int, int]] = []
+
+        try:
+            chunk_info_iterator = self.token_database.process_tokens(
+                tokens=tokens,
+                hashes=hashes,
+                offsets=offsets,
+                request_configs=request_configs,
+            )
+
+            # TODO: support batched_contains when layerwise is enabled
+            if self.use_layerwise:
+                # TODO: add layerwise gap support (see lookup() layerwise TODO)
+                # For now, fall back to prefix-only behavior.
+                # NOTE: this block is a copy of lookup()'s layerwise path —
+                # if lookup() changes its layerwise logic, update here too.
+                for start, end, key in chunk_info_iterator:
+                    assert isinstance(key, CacheEngineKey)
+                    key_all_layers = key.split_layers(self.num_layers)
+                    hit_chunks, block_mapping = self.storage_manager.batched_contains(
+                        key_all_layers,
+                        search_range,
+                        pin,
+                    )
+                    if hit_chunks == self.num_layers and len(block_mapping) == 1:
+                        if pin:
+                            assert lookup_id is not None, (
+                                "lookup_id is required when pin is True"
+                            )
+                            location = next(iter(block_mapping.keys()))
+                            self.lookup_pins[lookup_id][location].extend(key_all_layers)
+                        res = end
+                        continue
+                    return res, []
+            else:
+                chunk_info_list = []
+                keys = []
+                for chunk_info in chunk_info_iterator:
+                    assert isinstance(chunk_info[2], CacheEngineKey)
+                    chunk_info_list.append(chunk_info)
+                    keys.append(chunk_info[2])
+
+                furthest_hit_end, chunk_gaps, block_mapping = (
+                    self.storage_manager.batched_contains_with_gaps(
+                        keys, search_range, pin
+                    )
+                )
+
+                if pin and block_mapping:
+                    assert lookup_id is not None, (
+                        "lookup_id is required when pin is True"
+                    )
+                    self.lookup_pins[lookup_id] = block_mapping
+
+                if furthest_hit_end > 0:
+                    res = chunk_info_list[furthest_hit_end - 1][1]
+                    for chunk_gap_start, chunk_gap_end in chunk_gaps:
+                        token_start = chunk_info_list[chunk_gap_start][0]
+                        token_end = chunk_info_list[chunk_gap_end - 1][1]
+                        gaps.append((token_start, token_end))
+
+            return res, gaps
+
+        finally:
+            self.stats_monitor.on_lookup_finished(lookup_stats, res)
+            if pin:
+                self.storage_manager.touch_cache()
+
+    @_lmcache_nvtx_annotate
     def move(
         self,
         tokens: Union[torch.Tensor, List[int]],
