@@ -42,6 +42,8 @@ def create_test_config(
     disk_path: str,
     max_disk_size: float = 1.0,
     local_disk_path_sharding: str = "by_gpu",
+    disk_gap_rate: float = 0.0,
+    disk_gap_count: int = 0,
 ):
     """Create a test configuration for LocalDiskBackend."""
     config = LMCacheEngineConfig.from_defaults(
@@ -50,6 +52,8 @@ def create_test_config(
         local_disk_path_sharding=local_disk_path_sharding,
         max_local_disk_size=max_disk_size,
         lmcache_instance_id="test_instance",
+        disk_gap_rate=disk_gap_rate,
+        disk_gap_count=disk_gap_count,
     )
     return config
 
@@ -379,3 +383,104 @@ class TestParseLocalDisk:
 
     def test_empty_string(self):
         assert _parse_local_disk("") is None
+
+
+# ---------------------------------------------------------------------------
+# Tests for batched_contains_gaps() with fault injection
+# ---------------------------------------------------------------------------
+from unittest.mock import MagicMock, patch  # noqa: E402
+
+
+def _make_backend_cpu(
+    temp_disk_path,
+    async_loop,
+) -> "LocalDiskBackend":
+    """Create a LocalDiskBackend with cpu device (no CUDA needed)."""
+    config = create_test_config(
+        temp_disk_path,
+    )
+    cpu_config = LMCacheEngineConfig.from_legacy(chunk_size=256)
+    from lmcache.v1.memory_management import AdHocMemoryAllocator
+    allocator = AdHocMemoryAllocator(1024 * 1024 * 1024)  # 1 GiB
+    cpu_backend = LocalCPUBackend(cpu_config, memory_allocator=allocator)
+    return LocalDiskBackend(
+        config=config,
+        loop=async_loop,
+        local_cpu_backend=cpu_backend,
+        dst_device="cpu",
+    )
+
+
+def _inject_keys(backend: "LocalDiskBackend", keys) -> None:
+    """Directly insert keys into backend.dict so contains() returns True."""
+    for key in keys:
+        backend.dict[key] = MagicMock()
+
+
+class TestBatchedContainsGaps:
+    """Tests for LocalDiskBackend.batched_contains_gaps()."""
+
+    # ------------------------------------------------------------------
+    # Basic behavior (no fault injection)
+    # ------------------------------------------------------------------
+
+    def test_empty_keys_returns_empty_gaps(self, temp_disk_path, async_loop):
+        backend = _make_backend_cpu(temp_disk_path, async_loop)
+        gaps, end = backend.batched_contains_gaps([])
+        assert gaps == []
+        assert end == 0
+
+    def test_all_present_returns_empty_gaps(self, temp_disk_path, async_loop):
+        backend = _make_backend_cpu(temp_disk_path, async_loop)
+        keys = [create_test_key(i) for i in range(4)]
+        _inject_keys(backend, keys)
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == []
+        assert end == 4
+
+    def test_all_absent_returns_end_zero(self, temp_disk_path, async_loop):
+        """All absent → no hits → end=0; no gaps (trailing misses not reported)."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop)
+        keys = [create_test_key(i) for i in range(4)]
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == []
+        assert end == 0
+
+    def test_gap_in_middle(self, temp_disk_path, async_loop):
+        """Keys 0,1,3 present; key 2 absent → gap at (2,3)."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop)
+        keys = [create_test_key(i) for i in range(4)]
+        _inject_keys(backend, [keys[0], keys[1], keys[3]])
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == [(2, 3)]
+        assert end == 4
+
+    def test_end_truncated_at_last_hit(self, temp_disk_path, async_loop):
+        """Trailing misses stripped: end == last_hit_end, not len(keys)."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop)
+        keys = [create_test_key(i) for i in range(5)]
+        _inject_keys(backend, [keys[0], keys[1]])
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert end == 2
+        assert gaps == []
+
+    def test_consecutive_gaps_merged(self, temp_disk_path, async_loop):
+        """Keys 1,2 both absent → single interval (1,3), not two entries."""
+        backend = _make_backend_cpu(temp_disk_path, async_loop)
+        keys = [create_test_key(i) for i in range(5)]
+        _inject_keys(backend, [keys[0], keys[3], keys[4]])
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == [(1, 3)]
+        assert end == 5
+
+    def test_pin_hits_are_pinned(self, temp_disk_path, async_loop):
+        backend = _make_backend_cpu(temp_disk_path, async_loop)
+        keys = [create_test_key(i) for i in range(3)]
+        mock_objs = [MagicMock() for _ in range(3)]
+        for key, obj in zip(keys, mock_objs, strict=False):
+            backend.dict[key] = obj
+
+        gaps, end = backend.batched_contains_gaps(keys, pin=True)
+        for obj in mock_objs:
+            obj.pin.assert_called_once()
+
