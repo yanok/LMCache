@@ -1539,6 +1539,18 @@ class LMCacheConnectorV1Impl:
             )
         return gaps
 
+    def get_num_gap_tokens(self, request: "Request") -> int:
+        """
+        Return total gap tokens for budget pre-reservation.
+
+        Called by the scheduler right after get_num_new_matched_tokens() so it
+        can reserve gap budget before admitting other waiting requests.
+        """
+        gaps = self._req_to_gaps.get(request.request_id)
+        if not gaps:
+            return 0
+        return sum(e - s for s, e in gaps)
+
     @_lmcache_nvtx_annotate
     def update_state_after_alloc(self, request: "Request", num_external_tokens: int):
         """
