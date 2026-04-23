@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 import threading
+from unittest.mock import MagicMock, patch
 
 # Third Party
 import pytest
@@ -42,7 +43,11 @@ class MockLMCacheWorker:
 
 
 def create_test_config(
-    local_cpu: bool = True, use_layerwise: bool = False, enable_blending: bool = False
+    local_cpu: bool = True,
+    use_layerwise: bool = False,
+    enable_blending: bool = False,
+    cpu_gap_rate: float = 0.0,
+    cpu_gap_count: int = 0,
 ):
     """Create a test configuration for LocalCPUBackend."""
     config = LMCacheEngineConfig.from_defaults(
@@ -51,6 +56,8 @@ def create_test_config(
         use_layerwise=use_layerwise,
         enable_blending=enable_blending,
         lmcache_instance_id="test_instance",
+        cpu_gap_rate=cpu_gap_rate,
+        cpu_gap_count=cpu_gap_count,
     )
     return config
 
@@ -613,3 +620,96 @@ class TestLocalCPUBackendAllocatorAlignment:
             assert kwargs.get("align_bytes") == 4096
         finally:
             backend.memory_allocator.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests for batched_contains_gaps() with fault injection
+# ---------------------------------------------------------------------------
+
+def _make_backend_cpu_simple(
+    memory_allocator,
+) -> LocalCPUBackend:
+    """Create a LocalCPUBackend for gap tests (no CUDA needed)."""
+    config = create_test_config()
+    PinMonitor.GetOrCreate(config)
+    return LocalCPUBackend(config=config, memory_allocator=memory_allocator)
+
+
+def _inject_hot_keys(backend: LocalCPUBackend, keys) -> None:
+    """Directly insert keys into backend.hot_cache so contains() returns True."""
+    for key in keys:
+        backend.hot_cache[key] = MagicMock()
+
+
+class TestBatchedContainsGapsCPU:
+    """Tests for LocalCPUBackend.batched_contains_gaps()."""
+
+    def teardown_method(self, method):
+        LMCStatsMonitor.unregister_all_metrics()
+        LMCStatsMonitor.DestroyInstance()
+        PinMonitor.DestroyInstance()
+
+    # ------------------------------------------------------------------
+    # Basic behavior (no fault injection)
+    # ------------------------------------------------------------------
+
+    def test_empty_keys_returns_empty_gaps(self, memory_allocator):
+        backend = _make_backend_cpu_simple(memory_allocator)
+        gaps, end = backend.batched_contains_gaps([])
+        assert gaps == []
+        assert end == 0
+
+    def test_all_present_returns_empty_gaps(self, memory_allocator):
+        backend = _make_backend_cpu_simple(memory_allocator)
+        keys = [create_test_key(str(i)) for i in range(4)]
+        _inject_hot_keys(backend, keys)
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == []
+        assert end == 4
+
+    def test_all_absent_returns_end_zero(self, memory_allocator):
+        """All absent -> no hits -> end=0; trailing misses not reported."""
+        backend = _make_backend_cpu_simple(memory_allocator)
+        keys = [create_test_key(str(i)) for i in range(4)]
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == []
+        assert end == 0
+
+    def test_gap_in_middle(self, memory_allocator):
+        """Keys 0,1,3 present; key 2 absent -> gap at (2,3)."""
+        backend = _make_backend_cpu_simple(memory_allocator)
+        keys = [create_test_key(str(i)) for i in range(4)]
+        _inject_hot_keys(backend, [keys[0], keys[1], keys[3]])
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == [(2, 3)]
+        assert end == 4
+
+    def test_end_truncated_at_last_hit(self, memory_allocator):
+        """Trailing misses stripped: end == last_hit_end, not len(keys)."""
+        backend = _make_backend_cpu_simple(memory_allocator)
+        keys = [create_test_key(str(i)) for i in range(5)]
+        _inject_hot_keys(backend, [keys[0], keys[1]])
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert end == 2
+        assert gaps == []
+
+    def test_consecutive_gaps_merged(self, memory_allocator):
+        """Keys 1,2 both absent -> single interval (1,3)."""
+        backend = _make_backend_cpu_simple(memory_allocator)
+        keys = [create_test_key(str(i)) for i in range(5)]
+        _inject_hot_keys(backend, [keys[0], keys[3], keys[4]])
+        gaps, end = backend.batched_contains_gaps(keys)
+        assert gaps == [(1, 3)]
+        assert end == 5
+
+    def test_pin_hits_are_pinned(self, memory_allocator):
+        backend = _make_backend_cpu_simple(memory_allocator)
+        keys = [create_test_key(str(i)) for i in range(3)]
+        mock_objs = [MagicMock() for _ in range(3)]
+        for key, obj in zip(keys, mock_objs):
+            backend.hot_cache[key] = obj
+
+        backend.batched_contains_gaps(keys, pin=True)
+        for obj in mock_objs:
+            obj.pin.assert_called_once()
+
