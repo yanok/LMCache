@@ -66,6 +66,10 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # Gap intervals within [vllm_cached_tokens, lmcache_cached_tokens) where
+    # KV is missing and must be recomputed by virtual requests.
+    # Empty list = no gaps (contiguous prefix hit).
+    gaps: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
