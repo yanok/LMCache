@@ -1282,6 +1282,12 @@ class LMCacheEngine:
                         token_start = chunk_info_list[chunk_gap_start][0]
                         token_end = chunk_info_list[chunk_gap_end - 1][1]
                         gaps.append((token_start, token_end))
+                    if chunk_gaps:
+                        logger.info(  # DEBUG: remove after gap recomputation debugging
+                            "gap block→token conversion: chunk_gaps=%s → token_gaps=%s",
+                            chunk_gaps,
+                            gaps,
+                        )
 
             return res, gaps
 

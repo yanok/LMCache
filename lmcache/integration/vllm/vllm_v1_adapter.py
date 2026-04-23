@@ -1426,7 +1426,7 @@ class LMCacheConnectorV1Impl:
         gaps = self._req_to_gaps.get(request.request_id)
         if gaps:
             gap_tokens = sum(e - s for s, e in gaps)
-            logger.debug(
+            logger.info(  # DEBUG: remove after gap recomputation debugging
                 "get_computed_token_gaps: reqid=%s gaps=%s total_gap_tokens=%d "
                 "(scheduler will create %d virtual request(s))",
                 request.request_id,
