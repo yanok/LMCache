@@ -80,6 +80,18 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": str,
     },
     "max_local_disk_size": {"type": float, "default": 0.0, "env_converter": float},
+    "cpu_gap_rate": {
+        "type": float, "default": 0.0, "env_converter": float, "mutable": True
+    },
+    "cpu_gap_count": {
+        "type": int, "default": 0, "env_converter": int, "mutable": True
+    },
+    "disk_gap_rate": {
+        "type": float, "default": 0.0, "env_converter": float, "mutable": True
+    },
+    "disk_gap_count": {
+        "type": int, "default": 0, "env_converter": int, "mutable": True
+    },
     "remote_url": {
         "type": Optional[str],
         "default": None,
