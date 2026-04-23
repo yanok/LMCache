@@ -441,6 +441,10 @@ class ReqMeta:
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    # Gap intervals per request, keyed by req_id.
+    # Populated by build_connector_meta() from LMCacheConnectorV1Impl._req_to_gaps.
+    # Used by start_load_kv() to skip gap positions during KV retrieval.
+    req_to_gaps: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -747,6 +751,34 @@ class LMCacheConnectorV1Impl:
         self.kv_caches = kv_caches
         self._manager.post_init()
 
+    @staticmethod
+    def _apply_gap_masks(
+        token_mask: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        gaps: list[tuple[int, int]],
+    ) -> None:
+        """Zero out gap positions in token_mask and slot_mapping in-place.
+
+        Gap positions must not be loaded from LMCache — their KV will be
+        computed fresh by the virtual requests the scheduler created for them.
+
+        token_mask: False means "do not load this position from LMCache".
+        slot_mapping: gap positions are set to slot_mapping[-1] (a dummy value
+            that is already used by the last allocated block, preventing the
+            worker from writing gap KV into any real slot).
+
+        Args:
+            token_mask: boolean mask, True = load from LMCache. Modified in-place.
+            slot_mapping: slot indices tensor. Modified in-place.
+            gaps: list of (start, end) half-open token intervals to zero out.
+        """
+        if not gaps:
+            return
+        dummy_slot = slot_mapping[-1].item()
+        for start, end in gaps:
+            token_mask[start:end] = False
+            slot_mapping[start:end] = dummy_slot
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -811,6 +843,12 @@ class LMCacheConnectorV1Impl:
             )
             token_mask[:masked_token_count] = False
 
+            # Apply gap masking: zero out positions that will be computed
+            # fresh by virtual requests.
+            gaps = metadata.req_to_gaps.get(request.req_id, [])
+            if gaps:
+                self._apply_gap_masks(token_mask, slot_mapping, gaps)
+
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             if self.use_layerwise:
                 if idx == last_idx:
@@ -853,8 +891,10 @@ class LMCacheConnectorV1Impl:
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
-                num_expected_tokens = (
-                    lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
+                # Count expected tokens directly from mask — accounts for
+                # gap positions that were zeroed out above.
+                num_expected_tokens = int(
+                    token_mask[:lmcache_cached_tokens].sum().item()
                 )
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
@@ -1594,6 +1634,23 @@ class LMCacheConnectorV1Impl:
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
+            self._req_to_gaps.pop(finished_req_id, None)
+
+        # Propagate gap intervals to worker-side metadata.
+        # Note: do NOT clear _req_to_gaps here. LMCache uses a lookup_cache()
+        # fast path that does not re-call lookup_with_gaps() on reschedule.
+        # Clearing would lose gaps for preempted requests that hit the fast path.
+        # Cleanup happens only for finished requests (popped above).
+        meta.req_to_gaps = self._req_to_gaps.copy()
+        if meta.req_to_gaps:
+            logger.debug(
+                "build_connector_meta: propagating gaps for %d request(s): %s",
+                len(meta.req_to_gaps),
+                {
+                    req_id: (len(gaps), sum(e - s for s, e in gaps))
+                    for req_id, gaps in meta.req_to_gaps.items()
+                },
+            )
 
         # We should load KV for:
         # 1. new requests
