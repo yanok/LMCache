@@ -355,8 +355,14 @@ class NixlStorageAgent(ABC):
     def post_blocking(self, handle: NixlXferHandle):
         state = self.nixl_agent.transfer(handle)
 
+        # time.sleep here is acceptable for now:
+        # - Dynamic backend writes: async_mode=True uses post_async + asyncio.sleep
+        #   instead, so post_blocking is only reached with async_mode=False (sync puts).
+        # - Dynamic backend reads: batched_get_non_blocking calls storage_to_mem
+        #   synchronously, but async reads are broken regardless.
         while state != "DONE" and state != "ERR":
             try:
+                time.sleep(0.001)
                 state = self.nixl_agent.check_xfer_state(handle)
             except nixlBind.nixlBackendError:
                 raise
