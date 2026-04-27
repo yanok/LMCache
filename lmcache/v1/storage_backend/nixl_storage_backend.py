@@ -953,7 +953,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         future = asyncio.run_coroutine_threadsafe(self.storage_to_mem([key]), self.loop)
 
         obj_list = future.result()
-        return obj_list[0]
+        return obj_list[0] if obj_list else None
 
     def batched_get_blocking(
         self,
