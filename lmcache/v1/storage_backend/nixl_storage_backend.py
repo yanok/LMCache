@@ -401,10 +401,11 @@ class NixlStorageAgent(ABC):
         #   synchronously, but async reads are broken regardless.
         while state != "DONE" and state != "ERR":
             try:
-                time.sleep(0.001)
                 state = self.nixl_agent.check_xfer_state(handle)
             except nixlBind.nixlBackendError:
                 raise
+            if state != "DONE" and state != "ERR":
+                time.sleep(0.001)
 
         if state == "ERR":
             raise RuntimeError("NIXL transfer failed")
