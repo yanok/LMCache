@@ -69,6 +69,7 @@ class NixlStorageConfig:
     use_direct_io: bool
     path: str
     use_hugepages: bool
+    enable_prog_thread: bool
 
     @staticmethod
     def validate_nixl_backend(dynamic_storage: bool, backend: str, device: str):
@@ -104,6 +105,7 @@ class NixlStorageConfig:
         backend = extra_config.get("nixl_backend")
         path = extra_config.get("nixl_path")
         use_hugepages = extra_config.get("nixl_use_hugepages", False)
+        enable_prog_thread = extra_config.get("nixl_enable_prog_thread", True)
 
         assert pool_size is not None
         assert backend is not None
@@ -149,6 +151,7 @@ class NixlStorageConfig:
             use_direct_io=use_direct_io,
             path=path,
             use_hugepages=use_hugepages,
+            enable_prog_thread=enable_prog_thread,
         )
 
 
@@ -286,6 +289,7 @@ class NixlStorageAgent(ABC):
         device: str,
         backend: str,
         backend_params: dict[str, str],
+        enable_prog_thread: bool,
     ):
         buffer_ptr = allocator.buffer_ptr
         buffer_size = allocator.buffer_size
@@ -293,7 +297,7 @@ class NixlStorageAgent(ABC):
 
         self.backend = backend
         self.agent_name = "NixlAgent_" + str(uuid.uuid4())
-        nixl_conf = NixlAgentConfig(backends=[])
+        nixl_conf = NixlAgentConfig(backends=[], enable_prog_thread=enable_prog_thread)
         self.nixl_agent = NixlAgent(self.agent_name, nixl_conf)
         self.nixl_agent.create_backend(backend, backend_params)
 
@@ -381,8 +385,9 @@ class NixlStaticStorageAgent(NixlStorageAgent):
         device: str,
         backend: str,
         backend_params: dict[str, str],
+        enable_prog_thread: bool,
     ):
-        super().__init__(allocator, device, backend, backend_params)
+        super().__init__(allocator, device, backend, backend_params, enable_prog_thread)
 
         page_size = allocator.align_bytes
 
@@ -449,8 +454,9 @@ class NixlDynamicStorageAgent(NixlStorageAgent):
         device: str,
         backend: str,
         backend_params: dict[str, str],
+        enable_prog_thread: bool,
     ):
-        super().__init__(allocator, device, backend, backend_params)
+        super().__init__(allocator, device, backend, backend_params, enable_prog_thread)
 
         if backend == "OBJ":
             self.mem_type = "OBJ"
@@ -705,6 +711,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             nixl_config.buffer_device,
             nixl_config.backend,
             nixl_config.backend_params,
+            nixl_config.enable_prog_thread,
         )
 
     @staticmethod
@@ -1012,6 +1019,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             nixl_config.buffer_device,
             nixl_config.backend,
             nixl_config.backend_params,
+            nixl_config.enable_prog_thread,
         )
 
     def set_presence_cache(self, cache: PresenceCache) -> None:
