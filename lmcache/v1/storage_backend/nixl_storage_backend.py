@@ -28,6 +28,18 @@ import uuid
 from nixl._api import nixl_agent as NixlAgent
 from nixl._api import nixl_agent_config as NixlAgentConfig
 from nixl._api import nixl_prepped_dlist_handle as NixlDlistHandle
+
+try:
+    # Third Party
+    from nixl._api import (
+        nixl_thread_sync_t,
+    )
+
+    _NIXL_SYNC_MODE_SUPPORTED = True
+except ImportError:
+    nixl_thread_sync_t = None  # type: ignore[assignment]
+    _NIXL_SYNC_MODE_SUPPORTED = False
+# Third Party
 from nixl._api import nixl_xfer_handle as NixlXferHandle
 from nixl._api import (
     nixlBind,
@@ -70,6 +82,7 @@ class NixlStorageConfig:
     path: str
     use_hugepages: bool
     enable_prog_thread: bool
+    sync_mode: Optional[Any]  # nixl_thread_sync_t, None if unsupported
 
     @staticmethod
     def validate_nixl_backend(dynamic_storage: bool, backend: str, device: str):
@@ -106,6 +119,24 @@ class NixlStorageConfig:
         path = extra_config.get("nixl_path")
         use_hugepages = extra_config.get("nixl_use_hugepages", False)
         enable_prog_thread = extra_config.get("nixl_enable_prog_thread", True)
+        sync_mode_str = extra_config.get("nixl_sync_mode", None)
+        if sync_mode_str is not None and not _NIXL_SYNC_MODE_SUPPORTED:
+            raise ValueError(
+                "nixl_sync_mode is set in config but this NIXL version does not "
+                "support the sync_mode argument in NixlAgentConfig "
+                "(requires ai-dynamo/nixl#1501). Remove nixl_sync_mode from config "
+                "or upgrade NIXL."
+            )
+        sync_mode = None
+        if sync_mode_str is not None:
+            attr_name = f"NIXL_THREAD_SYNC_{sync_mode_str.upper()}"
+            if not hasattr(nixl_thread_sync_t, attr_name):
+                raise ValueError(
+                    f"Invalid nixl_sync_mode '{sync_mode_str}'. "
+                    f"Valid values are the suffixes of NIXL_THREAD_SYNC_* "
+                    f"in nixl_thread_sync_t."
+                )
+            sync_mode = getattr(nixl_thread_sync_t, attr_name)
 
         assert pool_size is not None
         assert backend is not None
@@ -152,6 +183,7 @@ class NixlStorageConfig:
             path=path,
             use_hugepages=use_hugepages,
             enable_prog_thread=enable_prog_thread,
+            sync_mode=sync_mode,
         )
 
 
@@ -290,6 +322,7 @@ class NixlStorageAgent(ABC):
         backend: str,
         backend_params: dict[str, str],
         enable_prog_thread: bool,
+        sync_mode: Optional[Any] = None,
     ):
         buffer_ptr = allocator.buffer_ptr
         buffer_size = allocator.buffer_size
@@ -297,7 +330,13 @@ class NixlStorageAgent(ABC):
 
         self.backend = backend
         self.agent_name = "NixlAgent_" + str(uuid.uuid4())
-        nixl_conf = NixlAgentConfig(backends=[], enable_prog_thread=enable_prog_thread)
+        nixl_conf_kwargs: dict[str, Any] = {
+            "backends": [],
+            "enable_prog_thread": enable_prog_thread,
+        }
+        if sync_mode is not None:
+            nixl_conf_kwargs["sync_mode"] = sync_mode
+        nixl_conf = NixlAgentConfig(**nixl_conf_kwargs)
         self.nixl_agent = NixlAgent(self.agent_name, nixl_conf)
         self.nixl_agent.create_backend(backend, backend_params)
 
@@ -392,8 +431,11 @@ class NixlStaticStorageAgent(NixlStorageAgent):
         backend: str,
         backend_params: dict[str, str],
         enable_prog_thread: bool,
+        sync_mode: Optional[Any] = None,
     ):
-        super().__init__(allocator, device, backend, backend_params, enable_prog_thread)
+        super().__init__(
+            allocator, device, backend, backend_params, enable_prog_thread, sync_mode
+        )
 
         page_size = allocator.align_bytes
 
@@ -461,8 +503,11 @@ class NixlDynamicStorageAgent(NixlStorageAgent):
         backend: str,
         backend_params: dict[str, str],
         enable_prog_thread: bool,
+        sync_mode: Optional[Any] = None,
     ):
-        super().__init__(allocator, device, backend, backend_params, enable_prog_thread)
+        super().__init__(
+            allocator, device, backend, backend_params, enable_prog_thread, sync_mode
+        )
 
         if backend == "OBJ":
             self.mem_type = "OBJ"
@@ -718,6 +763,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             nixl_config.backend,
             nixl_config.backend_params,
             nixl_config.enable_prog_thread,
+            nixl_config.sync_mode,
         )
 
     @staticmethod
@@ -1026,6 +1072,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             nixl_config.backend,
             nixl_config.backend_params,
             nixl_config.enable_prog_thread,
+            nixl_config.sync_mode,
         )
 
     def set_presence_cache(self, cache: PresenceCache) -> None:
