@@ -789,10 +789,14 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             assert fmt is not None
 
             obj = self.memory_allocator.allocate(shape, dtype, fmt)
-            assert obj is not None
+            if obj is None:
+                logger.warning(
+                    "Failed to allocate memory, consider increasing the "
+                    "`nixl_buffer_size` value"
+                )
+                break
 
             obj_list.append(obj)
-
             mem_indices.append(obj.meta.address)
             storage_indices.append(metadata.index)
 
