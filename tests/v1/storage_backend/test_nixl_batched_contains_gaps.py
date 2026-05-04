@@ -47,6 +47,11 @@ def make_backend(query_responses):
     backend.enable_gap_detection = True
     backend.progress_lock = threading.RLock()
     backend.progress_set = set()
+    backend._gap_stat_lock = threading.Lock()
+    backend._gap_calls = 0
+    backend._gap_requests = 0
+    backend._gap_chunks = 0
+    backend._gap_last_log = 0.0  # force log on first call in tests
     return backend
 
 

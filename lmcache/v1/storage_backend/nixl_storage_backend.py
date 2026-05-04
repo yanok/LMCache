@@ -1289,6 +1289,11 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         self.enable_presence_cache = nixl_config.enable_presence_cache
         self.never_check_exists = nixl_config.never_check_exists
         self.enable_gap_detection = nixl_config.enable_gap_detection
+        self._gap_stat_lock = threading.Lock()
+        self._gap_calls = 0    # batched_contains_gaps calls that ran the query
+        self._gap_requests = 0  # calls that found ≥1 gap chunk
+        self._gap_chunks = 0    # total gap chunks across all calls
+        self._gap_last_log = time.monotonic()
         self.path = nixl_config.path
         self.direct_io_flag = 0
         if nixl_config.use_direct_io:
@@ -1957,6 +1962,25 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 i = j
             else:
                 i += 1
+
+        gap_chunks = sum(e - s for s, e in gaps)
+        with self._gap_stat_lock:
+            self._gap_calls += 1
+            if gap_chunks > 0:
+                self._gap_requests += 1
+                self._gap_chunks += gap_chunks
+            now = time.monotonic()
+            if now - self._gap_last_log >= 60.0:
+                logger.info(
+                    "gap detection: %d/%d lookups had gaps, %d gap chunks total",
+                    self._gap_requests,
+                    self._gap_calls,
+                    self._gap_chunks,
+                )
+                self._gap_calls = 0
+                self._gap_requests = 0
+                self._gap_chunks = 0
+                self._gap_last_log = now
 
         return (gaps, last_hit_end)
 
