@@ -292,6 +292,35 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
             hit_chunks += 1
         return hit_chunks
 
+    def batched_contains_gaps(
+        self,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+    ) -> Optional[tuple[List[tuple[int, int]], int]]:
+        """Check which keys are present and return gap ranges in one query.
+
+        The default implementation returns ``None``, signalling that this
+        backend does not support gap reporting and the caller should fall
+        back to prefix-only logic via :meth:`batched_contains`.
+
+        Backends that support gap reporting should override this method and
+        return ``(gaps, last_hit_end)`` where:
+
+        - ``gaps`` is a list of half-open ``(start, end)`` index ranges for
+          keys that are absent but lie *before* the final hit.
+        - ``last_hit_end`` is one past the index of the last hit (0 when
+          there are no hits).  Trailing misses after the last hit are not
+          reported as gaps — they are indicated by
+          ``last_hit_end < len(keys)`` so the caller can cascade them to
+          the next storage tier.
+
+        :param keys: Ordered list of keys to check.
+        :param pin: Whether to pin present keys.
+        :return: ``(gaps, last_hit_end)`` or ``None`` to opt out of gap
+            reporting.
+        """
+        return None
+
     def touch_cache(self) -> None:
         """
         Update cache policy with keys that were accessed during a request.

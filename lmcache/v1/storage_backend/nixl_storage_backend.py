@@ -1876,6 +1876,85 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             self._cache_add(remaining_keys[i].chunk_hash)
 
         return true_count + consecutive_hits
+    def batched_contains_gaps(
+        self,
+        keys: list[CacheEngineKey],
+        pin: bool = False,
+    ) -> Optional[tuple[list[tuple[int, int]], int]]:
+        """Check which keys are present and return gap ranges in one batch query.
+
+        Issues a single ``query_memory`` call for all N keys and returns the
+        gap structure so the caller can fetch only the missing chunks while
+        still using all cached chunks.
+
+        The in-DRAM presence cache is intentionally not consulted: this method
+        targets deployments without a presence cache, where real storage holes
+        (e.g. DOCA_MEMOS evict-on-collision) need to be detected via direct
+        remote queries.
+
+        Trailing misses after the last hit are **not** reported as gaps —
+        they are indicated by ``last_hit_end < len(keys)`` so the caller can
+        cascade them to the next storage tier.
+
+        :param keys: Ordered list of keys to check.
+        :param pin: Unused; kept for interface compatibility.
+        :return: ``(gaps, last_hit_end)`` where ``gaps`` is a list of
+            half-open ``(start, end)`` index ranges that were missing *before*
+            the final hit, and ``last_hit_end`` is one past the index of the
+            last hit (0 when there are no hits at all).  Returns ``None`` when
+            the underlying NIXL query raises an exception, signalling that the
+            caller should fall back to prefix-only logic.
+        :raises: Never raises — NIXL errors are caught and ``None`` is
+            returned instead.
+        """
+        if not keys:
+            return ([], 0)
+
+        if self.never_check_exists:
+            return None
+
+        reg_list = [(0, 0, 0, self._format_object_key(k)) for k in keys]
+        try:
+            resp = self.agent.nixl_agent.query_memory(
+                reg_list, self.agent.backend, mem_type=self.agent.mem_type
+            )
+            hits = [r is not None for r in resp]
+        except Exception as exc:
+            logger.warning("batched_contains_gaps query failed: %s", exc)
+            return None
+
+        # Snapshot the in-progress PUT set once under its lock and demote
+        # any keys whose async transfer is still in flight to misses.
+        # This matches the behaviour of contains(), which returns False for
+        # in-flight keys via exists_in_put_tasks().
+        with self.progress_lock:
+            in_progress = set(self.progress_set)
+        if in_progress:
+            hits = [
+                h and key not in in_progress for h, key in zip(hits, keys)
+            ]
+
+        # Find the index one past the last hit (trailing misses cascade to
+        # the next tier rather than being reported as gaps).
+        last_hit_end = 0
+        for i, hit in enumerate(hits):
+            if hit:
+                last_hit_end = i + 1
+
+        # Collect contiguous miss ranges within [0, last_hit_end).
+        gaps: list[tuple[int, int]] = []
+        i = 0
+        while i < last_hit_end:
+            if not hits[i]:
+                j = i + 1
+                while j < last_hit_end and not hits[j]:
+                    j += 1
+                gaps.append((i, j))
+                i = j
+            else:
+                i += 1
+
+        return (gaps, last_hit_end)
 
     async def batched_async_contains(
         self,

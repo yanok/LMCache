@@ -369,6 +369,23 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    def batched_contains_gaps(
+        self,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+    ) -> Optional[tuple[List[tuple[int, int]], int]]:
+        """Check which keys are present and return gap ranges.
+
+        The default implementation returns ``None``, signalling that this
+        connector does not support gap reporting and the caller should fall
+        back to prefix-only logic via :meth:`batched_contains`.
+
+        :param keys: Ordered list of keys to check.
+        :param pin: Whether to pin present keys.
+        :return: ``(gaps, last_hit_end)`` or ``None`` to opt out.
+        """
+        return None
+
     def support_batched_contains(self) -> bool:
         """
         Is supported batched_contains
