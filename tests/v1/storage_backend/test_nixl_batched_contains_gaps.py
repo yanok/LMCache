@@ -44,6 +44,7 @@ def make_backend(query_responses):
     backend._format_object_key = lambda key: f"key_{key.chunk_hash}"
     # Attributes required by batched_contains_gaps()
     backend.never_check_exists = False
+    backend.enable_gap_detection = True
     backend.progress_lock = threading.RLock()
     backend.progress_set = set()
     return backend
@@ -140,6 +141,15 @@ class TestBatchedContainsGapsNixl:
         keys = [make_key(i) for i in range(3)]
         backend = make_backend(["d0", "d1", "d2"])
         backend.never_check_exists = True
+        result = backend.batched_contains_gaps(keys)
+        assert result is None
+        backend.agent.nixl_agent.query_memory.assert_not_called()
+
+    def test_gap_detection_disabled_returns_none(self):
+        # When enable_gap_detection=False (default), returns None immediately — no NIXL call
+        keys = [make_key(i) for i in range(3)]
+        backend = make_backend(["d0", "d1", "d2"])
+        backend.enable_gap_detection = False
         result = backend.batched_contains_gaps(keys)
         assert result is None
         backend.agent.nixl_agent.query_memory.assert_not_called()

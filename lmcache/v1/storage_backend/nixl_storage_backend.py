@@ -110,6 +110,7 @@ class NixlStorageConfig:
     enable_prog_thread: bool
     sync_mode: Optional[Any]  # nixl_thread_sync_t, None if unsupported
     never_check_exists: bool
+    enable_gap_detection: bool
 
     @staticmethod
     def validate_nixl_backend(backend: str, device: str) -> bool:
@@ -189,6 +190,7 @@ class NixlStorageConfig:
                 )
             sync_mode = getattr(nixl_thread_sync_t, attr_name)
         never_check_exists = extra_config.get("nixl_never_check_exists", False)
+        enable_gap_detection = extra_config.get("nixl_enable_gap_detection", False)
 
         if never_check_exists:
             assert enable_presence_cache, "enable_presence_cache must be True when never_check_exists is True"
@@ -251,6 +253,7 @@ class NixlStorageConfig:
             enable_prog_thread=enable_prog_thread,
             sync_mode=sync_mode,
             never_check_exists=never_check_exists,
+            enable_gap_detection=enable_gap_detection,
         )
 
 
@@ -1285,6 +1288,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         self.async_mode = nixl_config.enable_async_put
         self.enable_presence_cache = nixl_config.enable_presence_cache
         self.never_check_exists = nixl_config.never_check_exists
+        self.enable_gap_detection = nixl_config.enable_gap_detection
         self.path = nixl_config.path
         self.direct_io_flag = 0
         if nixl_config.use_direct_io:
@@ -1910,7 +1914,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         if not keys:
             return ([], 0)
 
-        if self.never_check_exists:
+        if not self.enable_gap_detection or self.never_check_exists:
             return None
 
         reg_list = [(0, 0, 0, self._format_object_key(k)) for k in keys]
