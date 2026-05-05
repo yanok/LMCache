@@ -27,6 +27,47 @@ _GAP_RESPONSE_PREFIX = b"\x02"
 _WANT_GAPS_KEY = "__lmcache_want_gaps"
 
 
+def _merge_gap_union(
+    all_gaps: list[list[tuple[int, int]]],
+    extent: int,
+) -> list[tuple[int, int]]:
+    """Return the union of gap intervals from all ranks, clipped to [0, extent).
+
+    Taking only one rank's gaps (e.g. the min-extent rank) is incorrect when
+    two ranks share the same extent but have holes at different positions: the
+    scheduler would create virtual requests for one rank's gaps and silently
+    leave the other rank's gaps unfilled (garbage KV entering the GPU).
+
+    Merging the union ensures every position missing on *any* rank is covered
+    by a virtual request.
+
+    Args:
+        all_gaps: one list of (start, end) intervals per rank.
+        extent:   the agreed-upon furthest hit token position (min across ranks).
+
+    Returns:
+        Sorted, non-overlapping half-open intervals within [0, extent).
+    """
+    intervals: list[tuple[int, int]] = []
+    for rank_gaps in all_gaps:
+        for s, e in rank_gaps:
+            clipped_e = min(e, extent)
+            if s < clipped_e:
+                intervals.append((s, clipped_e))
+
+    if not intervals:
+        return []
+
+    intervals.sort()
+    merged: list[tuple[int, int]] = [intervals[0]]
+    for s, e in intervals[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
 class LMCacheLookupClient(LookupClientInterface):
     """
     Lookup client that communicates with a lookup server
@@ -245,11 +286,13 @@ class LMCacheLookupClient(LookupClientInterface):
                 all_hit_tokens,
             )
 
-        # Use minimum hit count across ranks (same policy as lookup())
+        # Use minimum hit count across ranks (same policy as lookup()).
         num_hit = min(all_hit_tokens)
-        # Use gaps from the rank with minimum hit count
-        min_rank = all_hit_tokens.index(num_hit)
-        gaps = all_gaps[min_rank]
+        # Use the union of all ranks' gaps clipped to [0, num_hit).
+        # Using only one rank's gaps is incorrect when ranks share the same
+        # extent but have holes at different positions — the other ranks'
+        # undiscovered gaps would receive garbage KV from stale GPU slots.
+        gaps = _merge_gap_union(all_gaps, num_hit)
 
         # Cache the hit count (same key as lookup() for lookup_cache() compatibility)
         self.reqs_status[lookup_id] = num_hit

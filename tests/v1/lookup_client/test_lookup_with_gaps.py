@@ -20,6 +20,7 @@ from lmcache.v1.lookup_client.factory import LookupClientFactory
 from lmcache.v1.lookup_client.lmcache_lookup_client import (
     LMCacheLookupClient,
     LMCacheLookupServer,
+    _merge_gap_union,
 )
 from tests.v1.utils import (
     create_test_config,
@@ -213,3 +214,56 @@ class TestLMCacheLookupClientWithGaps:
             with make_client(lmcache_engine) as client:
                 result = client.lookup_with_gaps([], "req-empty")
                 assert result == (0, [])
+
+
+class TestMergeGapUnion:
+    """Unit tests for _merge_gap_union — the cross-rank gap union helper."""
+
+    def test_empty_all_ranks(self):
+        assert _merge_gap_union([], 100) == []
+
+    def test_empty_gaps_single_rank(self):
+        assert _merge_gap_union([[]], 100) == []
+
+    def test_single_rank_single_gap(self):
+        assert _merge_gap_union([[(20, 30)]], 100) == [(20, 30)]
+
+    def test_single_rank_multiple_gaps(self):
+        assert _merge_gap_union([[(10, 20), (50, 60)]], 100) == [(10, 20), (50, 60)]
+
+    def test_two_ranks_identical_gaps(self):
+        # Duplicate intervals collapse to one
+        result = _merge_gap_union([[(20, 30)], [(20, 30)]], 100)
+        assert result == [(20, 30)]
+
+    def test_two_ranks_disjoint_gaps(self):
+        # Core case: rank 0 has gap at [20,30), rank 1 has gap at [50,60)
+        result = _merge_gap_union([[(20, 30)], [(50, 60)]], 100)
+        assert result == [(20, 30), (50, 60)]
+
+    def test_two_ranks_overlapping_gaps_merge(self):
+        result = _merge_gap_union([[(20, 40)], [(30, 50)]], 100)
+        assert result == [(20, 50)]
+
+    def test_gap_clipped_to_extent(self):
+        # Rank 1 has a gap that extends beyond the agreed-upon extent
+        result = _merge_gap_union([[(20, 30)], [(80, 120)]], 100)
+        assert result == [(20, 30), (80, 100)]
+
+    def test_gap_entirely_beyond_extent_excluded(self):
+        result = _merge_gap_union([[(20, 30)], [(100, 110)]], 100)
+        assert result == [(20, 30)]
+
+    def test_extent_zero(self):
+        result = _merge_gap_union([[(0, 50)], [(0, 80)]], 0)
+        assert result == []
+
+    def test_no_hits_all_ranks_all_miss(self):
+        # extent=0 means no hits — no gaps within range
+        result = _merge_gap_union([[], [], []], 0)
+        assert result == []
+
+    def test_three_ranks_union(self):
+        result = _merge_gap_union([[(10, 20)], [(30, 40)], [(20, 35)]], 100)
+        # [10,20) + [20,35) merges to [10,35); [30,40) absorbed; result [10,40)
+        assert result == [(10, 40)]
