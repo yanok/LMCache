@@ -1261,7 +1261,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 for key in keys:
                     with self.progress_lock:
                         self.progress_set.discard(key)
-                    self._cache_add(key.chunk_hash)
+                        self._cache_add(key.chunk_hash)
 
             for mem_obj in mem_objs:
                 mem_obj.ref_count_down()
@@ -1322,7 +1322,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             for key in keys:
                 with self.progress_lock:
                     self.progress_set.discard(key)
-                self._cache_add(key.chunk_hash)
+                    self._cache_add(key.chunk_hash)
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         """
