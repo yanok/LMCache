@@ -205,3 +205,30 @@ def test_mru_with_pin():
     evict_candidates = policy.get_evict_candidates(cache_dict, num_candidates=2)
     # key1 is most recent, followed by key3, but since key3 is pinned, wo go to key2.
     assert evict_candidates == [key1, key2], (evict_candidates, [key1, key2])
+
+
+def test_noop():
+    policy = get_cache_policy("NOOP")
+    cache_dict = policy.init_mutable_mapping()
+    obj1 = DummyMemoryObj()
+    obj2 = DummyMemoryObj()
+    obj3 = DummyMemoryObj()
+    key1 = dumb_cache_engine_key(1)
+    key2 = dumb_cache_engine_key(2)
+    key3 = dumb_cache_engine_key(3)
+
+    cache_dict[key1] = obj1
+    policy.update_on_put(key1)
+    cache_dict[key2] = obj2
+    policy.update_on_put(key2)
+    cache_dict[key3] = obj3
+    policy.update_on_put(key3)
+
+    # NOOP never yields eviction candidates regardless of access pattern.
+    policy.update_on_hit(key1, cache_dict)
+    policy.update_on_hit(key2, cache_dict)
+    assert policy.get_evict_candidates(cache_dict, num_candidates=3) == []
+    assert policy.get_evict_candidates(cache_dict, num_candidates=1) == []
+
+    # Hook methods must not raise.
+    policy.update_on_force_evict(key3)

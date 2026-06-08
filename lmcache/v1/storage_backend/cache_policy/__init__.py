@@ -8,6 +8,7 @@ from lmcache.v1.storage_backend.cache_policy.fifo import FIFOCachePolicy
 from lmcache.v1.storage_backend.cache_policy.lfu import LFUCachePolicy
 from lmcache.v1.storage_backend.cache_policy.lru import LRUCachePolicy
 from lmcache.v1.storage_backend.cache_policy.mru import MRUCachePolicy
+from lmcache.v1.storage_backend.cache_policy.noop import NOOPCachePolicy
 
 # Cache policy mapping
 POLICY_MAPPING: Dict[str, Type[BaseCachePolicy]] = {
@@ -15,6 +16,7 @@ POLICY_MAPPING: Dict[str, Type[BaseCachePolicy]] = {
     "LFU": LFUCachePolicy,
     "FIFO": FIFOCachePolicy,
     "MRU": MRUCachePolicy,
+    "NOOP": NOOPCachePolicy,
 }
 
 
