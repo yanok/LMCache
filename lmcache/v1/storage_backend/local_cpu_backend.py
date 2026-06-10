@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import math
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
 import threading
@@ -81,6 +82,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # Store config and metadata for chunk budget calculation
         self.config = config
         self.metadata = metadata
+
+        ratio = config.hot_cache_fill_ratio
+        if self.use_hot and ratio < 1.0:
+            total_chunks = self.calculate_chunk_budget()
+            self._hot_cache_cap: Optional[int] = math.floor(ratio * total_chunks)
+        else:
+            self._hot_cache_cap = None
 
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
