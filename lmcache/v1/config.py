@@ -380,6 +380,18 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": "LRU",
         "env_converter": str,
     },
+    "hot_cache_fill_ratio": {
+        "type": float,
+        "default": 1.0,
+        "env_converter": float,
+        "description": (
+            "Fraction of the CPU memory pool that hot_cache is allowed to "
+            "occupy permanently (0.0, 1.0]. The remaining fraction stays "
+            "available for transient staging buffers (NIXL, LocalDisk). "
+            "Use < 1.0 with cache_policy=NOOP to prevent pool exhaustion. "
+            "Default is 1.0 (no cap, current behaviour)."
+        ),
+    },
     "numa_mode": {
         "type": Optional[str],
         "default": None,
@@ -620,6 +632,12 @@ def _validate_config(self):
     if self.min_retrieve_tokens < 0:
         raise ValueError(
             "min_retrieve_tokens must be >= 0, got %d" % self.min_retrieve_tokens
+        )
+
+    if not (0.0 < self.hot_cache_fill_ratio <= 1.0):
+        raise ValueError(
+            f"hot_cache_fill_ratio must be in (0.0, 1.0], "
+            f"got {self.hot_cache_fill_ratio}"
         )
 
     if self.enable_blending:
