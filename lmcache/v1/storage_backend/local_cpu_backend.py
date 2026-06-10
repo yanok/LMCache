@@ -169,6 +169,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if key in self.hot_cache:
                 return None
 
+            if self._hot_cache_cap is not None and len(self.hot_cache) >= self._hot_cache_cap:
+                return None
+
             memory_obj.ref_count_up()
             self.hot_cache[key] = memory_obj
 
