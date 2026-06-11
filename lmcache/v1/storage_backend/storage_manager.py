@@ -386,12 +386,18 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,
         location: Optional[str] = None,
+        hot_chunk_limit: int | None = None,
     ) -> None:
         """
         Non-blocking function to batched put the memory objects into the
         storage backends.
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
+
+        :param hot_chunk_limit: If set, only the first ``hot_chunk_limit`` keys
+            are submitted to hot-cache backends (those with ``use_hot=True``).
+            Other backends receive the full key list. When ``None``, behavior is
+            unchanged.
         """
         # The dictionary from backend cname to objects and keys
         obj_dict: dict[
@@ -425,7 +431,15 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+            if hot_chunk_limit is not None and getattr(backend, "use_hot", False):
+                submit_ks = ks[:hot_chunk_limit]
+                submit_objs = objs[:hot_chunk_limit]
+            else:
+                submit_ks = ks
+                submit_objs = objs
+            backend.batched_submit_put_task(
+                submit_ks, submit_objs, transfer_spec=transfer_spec
+            )
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:

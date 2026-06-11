@@ -21,6 +21,7 @@ Key scenarios tested:
 
 # Standard
 import asyncio
+from unittest.mock import MagicMock, patch
 
 # Third Party
 import pytest
@@ -368,3 +369,162 @@ class TestStorageManagerPrefetchCallback:
             assert not obj.ref_count_down_called
         for obj in tier0_objs[4:]:
             assert obj.ref_count_down_called
+
+
+# ---------------------------------------------------------------------------
+# Helpers for TestBatchedPutHotChunkLimit
+# ---------------------------------------------------------------------------
+
+
+def _make_hot_limit_manager(
+    event_manager: EventManager,
+    num_keys: int,
+    hot_backend: bool = True,
+    cold_backend: bool = False,
+):
+    """
+    Build a StorageManager with mocked internals for hot_chunk_limit testing.
+
+    The manager is created in scheduler role (no GPU init). All backends and the
+    allocator are replaced with lightweight mocks. ``allocate_and_copy_objects``
+    is NOT called during tests that use this helper — the hot/cold backends share
+    the same allocator cname as the primary slot so ``batched_put`` reuses the
+    existing ``obj_dict`` entry without allocating.
+
+    Returns
+    -------
+    (manager, keys, src_objs, hot_mock, cold_mock)
+        *hot_mock* / *cold_mock* are ``None`` when the backend was not requested.
+    """
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=False,
+        lmcache_instance_id="test_hot_limit",
+    )
+    metadata = LMCacheMetadata(
+        model_name="test_model",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(28, 2, 256, 8, 128),
+        role="scheduler",
+    )
+
+    with patch(
+        "lmcache.v1.storage_backend.storage_manager.CreateStorageBackends",
+        return_value={},
+    ):
+        from lmcache.v1.storage_backend.storage_manager import StorageManager
+
+        manager = StorageManager(
+            config=config,
+            metadata=metadata,
+            event_manager=event_manager,
+        )
+
+    # Use plain strings as keys — batched_put only slices them.
+    keys = [f"key_{i}" for i in range(num_keys)]
+    src_objs = [MockMemoryObj(i) for i in range(num_keys)]
+
+    # Primary allocator mock. get_backend_cname() uses __class__.__name__
+    # so we use a named MagicMock spec.
+    primary_alloc = MagicMock(name="PrimaryAllocator")
+    primary_alloc.__class__ = type("PrimaryAllocator", (), {})
+    manager.allocator_backend = primary_alloc  # type: ignore[assignment]
+    manager.internal_copy_stream = None
+
+    def _make_backend_mock(use_hot: bool) -> MagicMock:
+        """Build a storage backend mock whose allocator cname matches primary."""
+        backend = MagicMock()
+        backend.use_hot = use_hot
+        # Sharing the primary allocator means obj_dict already has an entry for
+        # this cname; allocate_and_copy_objects is never invoked.
+        backend.get_allocator_backend.return_value = primary_alloc
+        submitted_keys: list = []
+        submitted_objs: list = []
+        backend.submitted_keys = submitted_keys
+        backend.submitted_objs = submitted_objs
+
+        def _capture(ks, objs, transfer_spec=None, **kw):
+            submitted_keys.append(list(ks))
+            submitted_objs.append(list(objs))
+
+        backend.batched_submit_put_task.side_effect = _capture
+        return backend
+
+    hot_mock = _make_backend_mock(use_hot=True) if hot_backend else None
+    cold_mock = _make_backend_mock(use_hot=False) if cold_backend else None
+
+    backends = {}
+    if hot_mock is not None:
+        backends["hot"] = hot_mock
+    if cold_mock is not None:
+        backends["cold"] = cold_mock
+    manager.storage_backends = backends
+
+    return manager, keys, src_objs, hot_mock, cold_mock
+
+
+class TestBatchedPutHotChunkLimit:
+    """Tests for the hot_chunk_limit parameter in StorageManager.batched_put()."""
+
+    def test_hot_chunk_limit_truncates_hot_backend(self, event_manager):
+        """hot_chunk_limit=3 on 5 keys → hot backend receives only first 3 keys."""
+        manager, keys, src_objs, hot_mock, _ = _make_hot_limit_manager(
+            event_manager, num_keys=5, hot_backend=True, cold_backend=False
+        )
+        manager.batched_put(keys, src_objs, hot_chunk_limit=3)
+
+        assert hot_mock is not None
+        assert len(hot_mock.submitted_keys) == 1
+        assert hot_mock.submitted_keys[0] == keys[:3]
+
+    def test_hot_chunk_limit_zero(self, event_manager):
+        """hot_chunk_limit=0 → hot backend receives empty list."""
+        manager, keys, src_objs, hot_mock, _ = _make_hot_limit_manager(
+            event_manager, num_keys=5, hot_backend=True, cold_backend=False
+        )
+        manager.batched_put(keys, src_objs, hot_chunk_limit=0)
+
+        assert hot_mock is not None
+        assert len(hot_mock.submitted_keys) == 1
+        assert hot_mock.submitted_keys[0] == []
+
+    def test_hot_chunk_limit_none_passes_all_keys(self, event_manager):
+        """hot_chunk_limit=None → hot backend receives all keys (unchanged behavior)."""
+        manager, keys, src_objs, hot_mock, _ = _make_hot_limit_manager(
+            event_manager, num_keys=5, hot_backend=True, cold_backend=False
+        )
+        manager.batched_put(keys, src_objs, hot_chunk_limit=None)
+
+        assert hot_mock is not None
+        assert len(hot_mock.submitted_keys) == 1
+        assert len(hot_mock.submitted_keys[0]) == 5
+
+    def test_cold_backend_always_receives_full_list(self, event_manager):
+        """non-hot backends always receive full key list regardless of hot_chunk_limit."""
+        manager, keys, src_objs, hot_mock, cold_mock = _make_hot_limit_manager(
+            event_manager, num_keys=5, hot_backend=True, cold_backend=True
+        )
+        manager.batched_put(keys, src_objs, hot_chunk_limit=2)
+
+        assert hot_mock is not None
+        assert cold_mock is not None
+        assert hot_mock.submitted_keys[0] == keys[:2]
+        assert cold_mock.submitted_keys[0] == keys
+
+    def test_ref_count_down_called_on_all_objects(self, event_manager):
+        """ref_count_down() is called on ALL objects even when chunks are dropped."""
+        manager, keys, src_objs, _hot_mock, _ = _make_hot_limit_manager(
+            event_manager, num_keys=5, hot_backend=True, cold_backend=False
+        )
+        # hot_chunk_limit=2 means only 2 keys submitted to hot backend, but
+        # the obj_dict entry covers all 5 src_objs and must be fully released.
+        manager.batched_put(keys, src_objs, hot_chunk_limit=2)
+
+        for obj in src_objs:
+            assert obj.ref_count_down_called, (
+                f"Expected ref_count_down on obj {obj.obj_id}"
+            )
