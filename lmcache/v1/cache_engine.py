@@ -395,6 +395,11 @@ class LMCacheEngine:
 
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
+
+        :note: If ``hot_prefix_chunks`` is configured, only the first
+            ``hot_prefix_chunks`` chunks of the full prefix (measured from token 0)
+            are promoted to the hot cache. Chunks beyond that watermark are stored
+            in non-hot backends only.
         """
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
@@ -543,6 +548,14 @@ class LMCacheEngine:
 
         with store_stats.profile_put():
             transfer_spec = kwargs.get("transfer_spec", None)
+            hot_chunk_limit: int | None = None
+            if self.config.hot_prefix_chunks is not None:
+                # starts[0] is the absolute token index of the first stored chunk;
+                # integer division by chunk_size gives its chunk index.
+                already_stored_chunks = starts[0] // self.config.chunk_size
+                hot_chunk_limit = max(
+                    0, self.config.hot_prefix_chunks - already_stored_chunks
+                )
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
             self.storage_manager.batched_put(
@@ -550,6 +563,7 @@ class LMCacheEngine:
                 memory_objs,
                 transfer_spec=transfer_spec,
                 location=self.store_location,
+                hot_chunk_limit=hot_chunk_limit,
             )
 
         self.stats_monitor.on_store_finished(

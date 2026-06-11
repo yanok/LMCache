@@ -2055,3 +2055,199 @@ def test_compress_decompress_unpin_when_pinned() -> None:
             event_id="event_123",
         )
         mock_compressed_mem_obj.unpin.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# hot_chunk_limit tests — verify store() computes and passes the right value
+# ---------------------------------------------------------------------------
+
+
+def _make_store_engine(
+    process_tokens_results: list,
+    hot_prefix_chunks: int | None,
+    chunk_size: int = 2,
+) -> MagicMock:
+    """Build a mock LMCacheEngine suitable for calling LMCacheEngine.store().
+
+    Args:
+        process_tokens_results: list of (start, end, key) tuples that
+            token_database.process_tokens will yield.
+        hot_prefix_chunks: value for config.hot_prefix_chunks.
+        chunk_size: value for config.chunk_size.
+
+    Returns:
+        A MagicMock configured with all attributes store() accesses.
+    """
+    engine = MagicMock()
+
+    # Health / passive checks
+    engine.is_healthy.return_value = True
+    engine._is_passive.return_value = False
+    engine.is_frozen.return_value = False
+    engine.kv_events_enabled = False
+    engine.store_location = "local_cpu"
+    engine.fmt = None
+
+    # Config
+    engine.config.hot_prefix_chunks = hot_prefix_chunks
+    engine.config.chunk_size = chunk_size
+    engine.config.get_extra_config_value.return_value = False
+
+    # token_database — process_tokens must be side_effect so repeated
+    # calls (test e) can return different sequences.
+    engine.token_database.process_tokens.return_value = iter(
+        process_tokens_results
+    )
+
+    # Allocator returns a mock MemoryObj with numeric get_size()
+    mem_obj = MagicMock()
+    mem_obj.get_size.return_value = 0
+    engine.storage_manager.allocate.return_value = mem_obj
+
+    # stats_monitor context managers and numeric fields
+    store_stats = MagicMock()
+    store_stats.time_to_store.return_value = 0.0
+    store_stats.process_tokens_time = 0.0
+    store_stats.from_gpu_time = 0.0
+    store_stats.put_time = 0.0
+    engine.stats_monitor.on_store_request.return_value = store_stats
+
+    return engine
+
+
+def test_store_hot_chunk_limit_straddling_watermark():
+    """mask has 4 Falses + 6 Trues (chunk_size=2 → starts[0]=4,
+    already_stored_chunks=2), hot_prefix_chunks=3 → hot_chunk_limit=1."""
+    chunk_size = 2
+    # starts[0]=4, ends[0]=6 (first True-chunk), then 6->8, 8->10
+    keys = [_make_key(i) for i in range(3)]
+    process_results = [
+        (4, 6, keys[0]),
+        (6, 8, keys[1]),
+        (8, 10, keys[2]),
+    ]
+    engine = _make_store_engine(
+        process_results, hot_prefix_chunks=3, chunk_size=chunk_size
+    )
+
+    LMCacheEngine.store(engine, tokens=list(range(10)))
+
+    call_kwargs = engine.storage_manager.batched_put.call_args
+    assert call_kwargs is not None, "batched_put was not called"
+    hot_chunk_limit = call_kwargs.kwargs.get("hot_chunk_limit")
+    assert hot_chunk_limit == 1, (
+        f"Expected hot_chunk_limit=1, got {hot_chunk_limit}"
+    )
+
+
+def test_store_hot_chunk_limit_zero_when_past_watermark():
+    """mask has 8 Falses + 4 Trues → starts[0]=8, already_stored_chunks=4,
+    hot_prefix_chunks=3 → hot_chunk_limit=0."""
+    chunk_size = 2
+    keys = [_make_key(i) for i in range(2)]
+    process_results = [
+        (8, 10, keys[0]),
+        (10, 12, keys[1]),
+    ]
+    engine = _make_store_engine(
+        process_results, hot_prefix_chunks=3, chunk_size=chunk_size
+    )
+
+    LMCacheEngine.store(engine, tokens=list(range(12)))
+
+    call_kwargs = engine.storage_manager.batched_put.call_args
+    assert call_kwargs is not None, "batched_put was not called"
+    hot_chunk_limit = call_kwargs.kwargs.get("hot_chunk_limit")
+    assert hot_chunk_limit == 0, (
+        f"Expected hot_chunk_limit=0, got {hot_chunk_limit}"
+    )
+
+
+def test_store_hot_chunk_limit_none_when_config_not_set():
+    """When hot_prefix_chunks is None, hot_chunk_limit=None is passed."""
+    chunk_size = 2
+    keys = [_make_key(i) for i in range(2)]
+    process_results = [
+        (0, 2, keys[0]),
+        (2, 4, keys[1]),
+    ]
+    engine = _make_store_engine(
+        process_results, hot_prefix_chunks=None, chunk_size=chunk_size
+    )
+
+    LMCacheEngine.store(engine, tokens=list(range(4)))
+
+    call_kwargs = engine.storage_manager.batched_put.call_args
+    assert call_kwargs is not None, "batched_put was not called"
+    hot_chunk_limit = call_kwargs.kwargs.get("hot_chunk_limit")
+    assert hot_chunk_limit is None, (
+        f"Expected hot_chunk_limit=None, got {hot_chunk_limit}"
+    )
+
+
+def test_store_hot_chunk_limit_fully_before_watermark():
+    """No mask: starts[0]=0, already_stored_chunks=0,
+    hot_prefix_chunks=3 → hot_chunk_limit=3."""
+    chunk_size = 2
+    keys = [_make_key(i) for i in range(3)]
+    process_results = [
+        (0, 2, keys[0]),
+        (2, 4, keys[1]),
+        (4, 6, keys[2]),
+    ]
+    engine = _make_store_engine(
+        process_results, hot_prefix_chunks=3, chunk_size=chunk_size
+    )
+
+    LMCacheEngine.store(engine, tokens=list(range(6)))
+
+    call_kwargs = engine.storage_manager.batched_put.call_args
+    assert call_kwargs is not None, "batched_put was not called"
+    hot_chunk_limit = call_kwargs.kwargs.get("hot_chunk_limit")
+    assert hot_chunk_limit == 3, (
+        f"Expected hot_chunk_limit=3, got {hot_chunk_limit}"
+    )
+
+
+def test_store_growing_session_watermark():
+    """Simulate 3 successive store() calls as a session grows.
+
+    Request 1 — token indices 0..5 (all new): starts[0]=0,
+        already_stored=0, hot_chunk_limit=3
+    Request 2 — indices 0..5 cached, new 6..11: starts[0]=6,
+        already_stored=3, hot_chunk_limit=0
+    Request 3 — indices 0..11 cached, new 12..17: starts[0]=12,
+        already_stored=6, hot_chunk_limit=0
+
+    Expected sequence: [3, 0, 0]
+    """
+    chunk_size = 2
+    hot_prefix_chunks = 3
+
+    def _make_results(start_token: int, n_chunks: int) -> list:
+        return [
+            (start_token + i * chunk_size, start_token + (i + 1) * chunk_size, _make_key(start_token // chunk_size + i))
+            for i in range(n_chunks)
+        ]
+
+    req1_results = _make_results(0, 3)   # starts[0]=0
+    req2_results = _make_results(6, 3)   # starts[0]=6
+    req3_results = _make_results(12, 3)  # starts[0]=12
+
+    all_batches = [req1_results, req2_results, req3_results]
+    captured_limits: list[int | None] = []
+
+    for batch_results in all_batches:
+        engine = _make_store_engine(
+            batch_results,
+            hot_prefix_chunks=hot_prefix_chunks,
+            chunk_size=chunk_size,
+        )
+        LMCacheEngine.store(engine, tokens=list(range(18)))
+        call_kwargs = engine.storage_manager.batched_put.call_args
+        assert call_kwargs is not None, "batched_put was not called"
+        captured_limits.append(call_kwargs.kwargs.get("hot_chunk_limit"))
+
+    assert captured_limits == [3, 0, 0], (
+        f"Expected hot_chunk_limit sequence [3, 0, 0], got {captured_limits}"
+    )
