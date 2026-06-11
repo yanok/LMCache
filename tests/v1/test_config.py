@@ -967,6 +967,35 @@ class TestNixlBufferDeviceCpuValidation:
         config.validate()  # Should not raise
 
 
+class TestHotPrefixChunksConfig:
+    """Test cases for hot_prefix_chunks configuration field."""
+
+    def test_hot_prefix_chunks_default_is_none(self):
+        config = LMCacheEngineConfig.from_defaults()
+        assert config.hot_prefix_chunks is None
+
+    def test_hot_prefix_chunks_positive_value_accepted(self):
+        config = LMCacheEngineConfig.from_defaults(hot_prefix_chunks=10)
+        assert config.hot_prefix_chunks == 10
+
+    def test_hot_prefix_chunks_zero_raises(self):
+        config = LMCacheEngineConfig.from_defaults(hot_prefix_chunks=0)
+        with pytest.raises(ValueError, match="hot_prefix_chunks"):
+            config.validate()
+
+    def test_hot_prefix_chunks_negative_raises(self):
+        config = LMCacheEngineConfig.from_defaults(hot_prefix_chunks=-1)
+        with pytest.raises(ValueError, match="hot_prefix_chunks"):
+            config.validate()
+
+    def test_hot_prefix_chunks_with_enable_blending_raises(self):
+        config = LMCacheEngineConfig.from_defaults(
+            hot_prefix_chunks=3, enable_blending=True
+        )
+        with pytest.raises(ValueError, match="hot_prefix_chunks"):
+            config.validate()
+
+
 class TestNixlUseHugepagesDeprecation:
     """Validate the deprecation alias for extra_config.nixl_use_hugepages.
 

@@ -75,6 +75,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": _to_bool,
     },
     "max_local_cpu_size": {"type": float, "default": 5.0, "env_converter": float},
+    "hot_prefix_chunks": {
+        "type": Optional[int],
+        "default": None,
+        "env_converter": int,
+    },
     "local_cpu_use_hugepages": {
         "type": bool,
         "default": False,
@@ -638,6 +643,17 @@ def _validate_config(self):
         raise ValueError(
             f"hot_cache_fill_ratio must be in (0.0, 1.0], "
             f"got {self.hot_cache_fill_ratio}"
+        )
+
+    if self.hot_prefix_chunks is not None and self.hot_prefix_chunks <= 0:
+        raise ValueError(
+            f"hot_prefix_chunks must be a positive integer, got {self.hot_prefix_chunks}"
+        )
+
+    if self.hot_prefix_chunks is not None and self.enable_blending:
+        raise ValueError(
+            "hot_prefix_chunks is not compatible with enable_blending "
+            "(SegmentTokenDatabase uses variable-length chunks)"
         )
 
     if self.enable_blending:
