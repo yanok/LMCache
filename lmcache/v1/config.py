@@ -407,6 +407,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "drop_dram_to_hbm_copy": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
     "internal_api_server_enabled": {
         "type": bool,
         "default": False,

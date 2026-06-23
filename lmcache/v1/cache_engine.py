@@ -162,6 +162,7 @@ class LMCacheEngine:
             )
 
         self.async_loading = config.enable_async_loading
+        self.drop_dram_to_hbm_copy = config.drop_dram_to_hbm_copy
         self.event_manager = EventManager()
 
         self.use_layerwise = config.use_layerwise
@@ -904,9 +905,13 @@ class LMCacheEngine:
                 else:
                     memory_objs_for_togpu = list(memory_objs)
                 try:
-                    self.gpu_connector.batched_to_gpu(
-                        memory_objs_for_togpu, list(starts), list(ends), **kwargs
-                    )
+                    if not self.drop_dram_to_hbm_copy:
+                        self.gpu_connector.batched_to_gpu(
+                            memory_objs_for_togpu,
+                            list(starts),
+                            list(ends),
+                            **kwargs,
+                        )
                 finally:
                     # Release GPU substitute references so the temporary
                     # buffers can be freed; original memory_objs in
