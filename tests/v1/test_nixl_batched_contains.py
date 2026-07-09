@@ -10,6 +10,8 @@ dependencies (NIXL agent, memory allocators) are replaced by mocks.
 # Standard
 from typing import List
 from unittest.mock import Mock
+import threading
+import types
 
 # Third Party
 import pytest
@@ -54,6 +56,8 @@ def _mock_backend(**overrides) -> Mock:
     """
     backend = Mock(spec=NixlDynamicStorageBackend)
     backend.agent = Mock()
+    backend.progress_lock = threading.Lock()
+    backend.pending_removals = {}
     backend._cache_add = Mock()
     backend.presence_cache_only = False
     # Default: _format_object_key returns a predictable string
@@ -179,23 +183,33 @@ class TestContains:
     def test_cache_hit(self) -> None:
         """When the helper finds the key in the presence cache, return True."""
         backend = _mock_backend()
-        backend._exists_in_put_tasks_or_cache.return_value = (True, True)
+        backend._exists_in_put_tasks_or_cache.return_value = True
 
         assert self._call(backend, _make_key(1)) is True
         backend.key_exists.assert_not_called()
 
     def test_put_task_hit(self) -> None:
-        """When the key is in put tasks, return False immediately."""
+        """A key whose put is still in flight reports a hit, resolved
+        locally (the in-flight source buffer is served directly)."""
         backend = _mock_backend()
-        backend._exists_in_put_tasks_or_cache.return_value = (True, False)
+        key = _make_key(1)
+        backend.progress_lock = threading.Lock()
+        backend.progress_dict = {key: Mock()}
+        backend._cache_contains = Mock(return_value=False)
+        for method in ("_exists_in_put_tasks_or_cache", "exists_in_put_tasks"):
+            setattr(
+                backend,
+                method,
+                types.MethodType(getattr(NixlDynamicStorageBackend, method), backend),
+            )
 
-        assert self._call(backend, _make_key(1)) is False
+        assert self._call(backend, key) is True
         backend.key_exists.assert_not_called()
 
     def test_fallback_to_key_exists_hit(self) -> None:
         """When local lookup misses, fall back to key_exists and cache the result."""
         backend = _mock_backend()
-        backend._exists_in_put_tasks_or_cache.return_value = (False, False)
+        backend._exists_in_put_tasks_or_cache.return_value = False
         backend.key_exists.return_value = True
 
         key = _make_key(42)
@@ -206,7 +220,7 @@ class TestContains:
     def test_fallback_to_key_exists_miss(self) -> None:
         """When key_exists also returns False, return False and don't cache."""
         backend = _mock_backend()
-        backend._exists_in_put_tasks_or_cache.return_value = (False, False)
+        backend._exists_in_put_tasks_or_cache.return_value = False
         backend.key_exists.return_value = False
 
         assert self._call(backend, _make_key(42)) is False
@@ -216,7 +230,7 @@ class TestContains:
         """With presence_cache_only set, a presence-cache miss returns False
         without issuing the queryMem call (key_exists not called)."""
         backend = _mock_backend(presence_cache_only=True)
-        backend._exists_in_put_tasks_or_cache.return_value = (False, False)
+        backend._exists_in_put_tasks_or_cache.return_value = False
 
         assert self._call(backend, _make_key(7)) is False
         backend.key_exists.assert_not_called()
@@ -250,31 +264,30 @@ class TestBatchedContains:
         keys = _make_keys(3)
         backend = _mock_backend()
         backend._exists_in_put_tasks_or_cache.side_effect = [
-            (True, True),
-            (True, True),
-            (True, True),
+            True,
+            True,
+            True,
         ]
         assert self._call(backend, keys) == 3
         backend.agent.batched_nixl_desc_exists.assert_not_called()
 
-    # -- early-stop on put-task ---------------------------------------------
+    # -- in-flight puts count as hits -----------------------------------------
 
-    def test_first_key_in_put_tasks(self) -> None:
+    def test_inflight_put_extends_prefix(self) -> None:
+        """An in-flight put no longer breaks the consecutive-hit prefix:
+        it is locally known (its buffer is served directly), so the scan
+        continues past it."""
         keys = _make_keys(3)
         backend = _mock_backend()
+        # key 0 from presence cache, key 1 in flight, key 2 remote hit.
         backend._exists_in_put_tasks_or_cache.side_effect = [
-            (True, False),
+            True,
+            True,
+            False,
         ]
-        assert self._call(backend, keys) == 0
+        backend.agent.batched_nixl_desc_exists.return_value = 1
 
-    def test_second_key_in_put_tasks(self) -> None:
-        keys = _make_keys(3)
-        backend = _mock_backend()
-        backend._exists_in_put_tasks_or_cache.side_effect = [
-            (True, True),
-            (True, False),
-        ]
-        assert self._call(backend, keys) == 1
+        assert self._call(backend, keys) == 3
 
     # -- remote fallback ----------------------------------------------------
 
@@ -283,7 +296,7 @@ class TestBatchedContains:
         keys = _make_keys(3)
         backend = _mock_backend()
         backend._exists_in_put_tasks_or_cache.side_effect = [
-            (False, False),
+            False,
         ]
         backend.agent.batched_nixl_desc_exists.return_value = 2
 
@@ -297,8 +310,8 @@ class TestBatchedContains:
         keys = _make_keys(3)
         backend = _mock_backend()
         backend._exists_in_put_tasks_or_cache.side_effect = [
-            (True, True),
-            (False, False),
+            True,
+            False,
         ]
         backend.agent.batched_nixl_desc_exists.return_value = 1
 
@@ -313,8 +326,8 @@ class TestBatchedContains:
         keys = _make_keys(3)
         backend = _mock_backend(presence_cache_only=True)
         backend._exists_in_put_tasks_or_cache.side_effect = [
-            (True, True),
-            (False, False),
+            True,
+            False,
         ]
 
         assert self._call(backend, keys) == 1
@@ -326,7 +339,7 @@ class TestBatchedContains:
         keys = _make_keys(4)
         backend = _mock_backend()
         backend._exists_in_put_tasks_or_cache.side_effect = [
-            (False, False),
+            False,
         ]
         backend.agent.batched_nixl_desc_exists.return_value = 3
 
@@ -348,7 +361,7 @@ class TestBatchedContains:
         keys = _make_keys(3)
         backend = _mock_backend()
         backend._exists_in_put_tasks_or_cache.side_effect = [
-            (False, False),
+            False,
         ]
         backend.agent.batched_nixl_desc_exists.return_value = 0
 
@@ -366,9 +379,9 @@ class TestBatchedContains:
         backend = _mock_backend()
         # First 2 keys resolve locally, remaining 2 go remote
         backend._exists_in_put_tasks_or_cache.side_effect = [
-            (True, True),
-            (True, True),
-            (False, False),
+            True,
+            True,
+            False,
         ]
         backend.agent.batched_nixl_desc_exists.return_value = 0
 
@@ -381,11 +394,11 @@ class TestBatchedContains:
 
     def test_single_key_present(self) -> None:
         backend = _mock_backend()
-        backend._exists_in_put_tasks_or_cache.return_value = (True, True)
+        backend._exists_in_put_tasks_or_cache.return_value = True
         assert self._call(backend, _make_keys(1)) == 1
 
     def test_single_key_missing_remote(self) -> None:
         backend = _mock_backend()
-        backend._exists_in_put_tasks_or_cache.return_value = (False, False)
+        backend._exists_in_put_tasks_or_cache.return_value = False
         backend.agent.batched_nixl_desc_exists.return_value = 0
         assert self._call(backend, _make_keys(1)) == 0

@@ -172,7 +172,8 @@ def _mock_static_backend(
     backend.key_lock = threading.Lock()
     backend.progress_lock = threading.Lock()
     backend.key_dict = {}
-    backend.progress_set = set()
+    backend.progress_dict = {}
+    backend.pending_removals = {}
     backend.cache_policy = Mock()
 
     backend.pool = Mock()
@@ -262,11 +263,11 @@ class TestStaticPutSourceBufferProtection:
             "backend did not release its reference after the transfer completed"
         )
         # Completion also clears the in-flight marker.
-        assert _wait_until(lambda: not backend.progress_set)
+        assert _wait_until(lambda: not backend.progress_dict)
 
     def test_deduplicated_keys_do_not_leak_references(self, loop_thread) -> None:
         """Keys dropped by the dedup-on-submit filter (already in
-        ``progress_set``) must not acquire a reference that nobody
+        ``progress_dict``) must not acquire a reference that nobody
         releases."""
         gate = threading.Event()
         gate.set()  # transfers complete immediately
@@ -274,7 +275,7 @@ class TestStaticPutSourceBufferProtection:
         keys, objs = _make_put(1)
 
         # The key is already being written: submit must drop it.
-        backend.progress_set.add(keys[0])
+        backend.progress_dict[keys[0]] = _make_obj()
 
         _submit(backend, keys, objs)
 
@@ -292,7 +293,7 @@ class TestStaticPutSourceBufferProtection:
 
         _submit(backend, keys, objs)
 
-        assert not backend.progress_set
+        assert not backend.progress_dict
         assert all(obj.get_ref_count() == 1 for obj in objs)
 
 
@@ -317,10 +318,12 @@ def _mock_dynamic_backend(
     backend.loop = loop
     backend.async_mode = async_mode
     backend.progress_lock = threading.Lock()
-    backend.progress_set = set()
+    backend.progress_dict = {}
+    backend.pending_removals = {}
     backend.memory_allocator = Mock()
     backend.memory_allocator.align_bytes = 4096
     backend._cache_add = Mock()
+    backend._cache_discard = Mock()
 
     # descs, reg_descs, xfer_handler, handle
     backend._acquire_storage_handle = Mock(return_value=([], Mock(), Mock(), Mock()))
@@ -343,6 +346,7 @@ def _mock_dynamic_backend(
         "_submit_async_mem_to_storage",
         "_run_sync_mem_to_storage",
         "_wait_for_transfer",
+        "_finalize_put_state",
         "exists_in_put_tasks",
     ):
         setattr(
@@ -396,7 +400,7 @@ class TestDynamicPutSourceBufferProtection:
         assert _wait_until(lambda: all(obj.get_ref_count() == 0 for obj in objs)), (
             "backend did not release its reference after the transfer completed"
         )
-        assert _wait_until(lambda: not backend.progress_set)
+        assert _wait_until(lambda: not backend.progress_dict)
 
     def test_sync_mode_does_not_leak_references(self, loop_thread) -> None:
         """Sync mode blocks until the transfer completes, so no backend
@@ -412,7 +416,25 @@ class TestDynamicPutSourceBufferProtection:
             assert obj.get_ref_count() == 1, (
                 "sync-mode put changed the source buffer ref count"
             )
-        assert not backend.progress_set
+        assert not backend.progress_dict
+
+    def test_duplicate_async_put_keeps_original_inflight_state(
+        self, loop_thread
+    ) -> None:
+        gate = threading.Event()
+        backend = _mock_dynamic_backend(loop_thread.loop, gate, async_mode=True)
+        key = _make_key(1)
+        original = _make_obj()
+        duplicate = _make_obj()
+
+        backend.batched_submit_put_task([key], [original])
+        backend.batched_submit_put_task([key], [duplicate])
+
+        assert backend.progress_dict[key] is original
+        assert duplicate.get_ref_count() == 1
+
+        gate.set()
+        assert _wait_until(lambda: key not in backend.progress_dict)
 
     @pytest.mark.parametrize("async_mode", [False, True])
     def test_closed_loop_rolls_back_submit_state(self, async_mode: bool) -> None:
@@ -424,38 +446,448 @@ class TestDynamicPutSourceBufferProtection:
 
         backend.batched_submit_put_task(keys, objs)
 
-        assert not backend.progress_set
+        assert not backend.progress_dict
         assert all(obj.get_ref_count() == 1 for obj in objs)
 
 
 # ---------------------------------------------------------------------------
-# Write-failure cleanup
+# Serving in-flight puts (dynamic backend)
+# ---------------------------------------------------------------------------
+
+
+def _mock_serving_backend(
+    loop: asyncio.AbstractEventLoop,
+    transfer_gate: threading.Event,
+):
+    """Extend the dynamic-backend mock with the real lookup/read methods.
+
+    ``contains``/``batched_contains``/``storage_to_mem``/``get_blocking``
+    are bound real so the tests exercise the actual lookup and read paths;
+    the presence cache and remote existence check are mocked to miss, so
+    any hit must come from the in-flight put itself.
+    """
+    backend = _mock_dynamic_backend(loop, transfer_gate, async_mode=True)
+    backend.presence_cache_only = False
+    backend._cache_contains = Mock(return_value=False)
+    backend.key_exists = Mock(return_value=False)
+    backend._allocate_for_read = Mock(return_value=(None, [], []))
+    for method in (
+        "contains",
+        "batched_contains",
+        "_exists_in_put_tasks_or_cache",
+        "storage_to_mem",
+        "_storage_to_mem_remote",
+        "_borrow_inflight_puts",
+        "_release_get_results",
+        "get_blocking",
+        "batched_get_non_blocking",
+        "remove",
+    ):
+        setattr(
+            backend,
+            method,
+            types.MethodType(getattr(NixlDynamicStorageBackend, method), backend),
+        )
+    return backend
+
+
+class TestDynamicServeInflightPuts:
+    """An in-flight put's data is already in memory (the backend holds a
+    reference on the source buffer for the whole transfer), so lookups
+    should report a hit and reads should serve the source buffer directly
+    instead of reporting a miss and forcing a recompute."""
+
+    def test_contains_reports_inflight_put_as_hit(self, loop_thread) -> None:
+        gate = threading.Event()
+        backend = _mock_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(1)
+
+        backend.batched_submit_put_task(keys, objs)
+
+        assert backend.contains(keys[0]) is True, (
+            "in-flight put reported as a miss although its data is in memory"
+        )
+        # The hit must be resolved locally, not via a remote queryMem.
+        backend.key_exists.assert_not_called()
+
+        gate.set()
+        assert _wait_until(lambda: not backend.exists_in_put_tasks(keys[0]))
+
+    def test_batched_contains_counts_inflight_put_as_hit(self, loop_thread) -> None:
+        gate = threading.Event()
+        backend = _mock_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(2)
+
+        # key 0 is in the presence cache; key 1 is in flight.
+        backend._cache_contains.side_effect = lambda h: h == keys[0].chunk_hash
+        backend.batched_submit_put_task([keys[1]], [objs[1]])
+
+        assert backend.batched_contains(keys) == 2, (
+            "in-flight put broke the consecutive-hit prefix"
+        )
+        backend.agent.batched_nixl_desc_exists.assert_not_called()
+
+        gate.set()
+        assert _wait_until(lambda: not backend.exists_in_put_tasks(keys[1]))
+
+    def test_get_serves_source_buffer_during_inflight_put(self, loop_thread) -> None:
+        gate = threading.Event()
+        backend = _mock_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(1)
+
+        backend.batched_submit_put_task(keys, objs)
+        ref_before = objs[0].get_ref_count()
+
+        served = backend.get_blocking(keys[0])
+
+        assert served is objs[0], (
+            "in-flight read did not serve the in-memory source buffer"
+        )
+        assert served.get_ref_count() == ref_before + 1, (
+            "borrowed buffer must carry the reader's own reference"
+        )
+
+        gate.set()
+        assert _wait_until(lambda: not backend.exists_in_put_tasks(keys[0]))
+        served.ref_count_down()  # reader returns the borrow
+
+    def test_get_mixes_inflight_hit_with_remote_miss(self, loop_thread) -> None:
+        gate = threading.Event()
+        backend = _mock_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(2)
+
+        # Only key 0 is in flight; key 1 goes remote and misses
+        # (_allocate_for_read is mocked to fail, so the remote path
+        # returns None for it).
+        backend.batched_submit_put_task([keys[0]], [objs[0]])
+
+        results = backend.storage_to_mem(keys)
+
+        assert results[0] is objs[0]
+        assert results[1] is None
+
+        gate.set()
+        assert _wait_until(lambda: not backend.exists_in_put_tasks(keys[0]))
+        results[0].ref_count_down()
+
+    def test_borrow_survives_transfer_completion(self, loop_thread) -> None:
+        """A reader that borrowed the in-flight buffer keeps it alive after
+        the writer completes and releases its own reference."""
+        gate = threading.Event()
+        backend = _mock_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(1)
+
+        backend.batched_submit_put_task(keys, objs)
+        served = backend.get_blocking(keys[0])
+        assert served is objs[0]
+
+        # Caller drops its reference; writer completes and drops its own.
+        objs[0].ref_count_down()
+        gate.set()
+        assert _wait_until(lambda: not backend.exists_in_put_tasks(keys[0]))
+
+        assert served.get_ref_count() == 1, (
+            "reader's borrow must survive writer completion"
+        )
+        assert served.is_valid()
+        served.ref_count_down()
+        assert served.get_ref_count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Serving in-flight puts (static backend)
+# ---------------------------------------------------------------------------
+
+
+def _mock_static_serving_backend(
+    loop: asyncio.AbstractEventLoop,
+    transfer_gate: threading.Event,
+):
+    """Extend the static-backend mock with the real lookup/read methods."""
+    backend = _mock_static_backend(loop, transfer_gate)
+    for method in (
+        "contains",
+        "get_blocking",
+        "batched_get_blocking",
+        "batched_get_non_blocking",
+        "remove",
+        "_borrow_inflight_puts",
+        "_release_get_results",
+    ):
+        setattr(
+            backend,
+            method,
+            types.MethodType(getattr(NixlStaticStorageBackend, method), backend),
+        )
+    return backend
+
+
+class TestStaticServeInflightPuts:
+    """With the source buffer protected for the whole transfer, the static
+    backend can serve in-flight puts from memory too, instead of the
+    conservative in-flight = miss it adopted in the dirty-read fix."""
+
+    def test_contains_reports_inflight_put_as_hit(self, loop_thread) -> None:
+        gate = threading.Event()
+        backend = _mock_static_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(1)
+
+        _submit(backend, keys, objs)
+
+        assert backend.contains(keys[0]) is True, (
+            "in-flight put reported as a miss although its data is in memory"
+        )
+
+        gate.set()
+        assert _wait_until(lambda: all(o.get_ref_count() == 1 for o in objs))
+
+    def test_get_serves_source_buffer_during_inflight_put(self, loop_thread) -> None:
+        gate = threading.Event()
+        backend = _mock_static_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(1)
+
+        _submit(backend, keys, objs)
+        ref_before = objs[0].get_ref_count()
+
+        # The transfer blocks the backend event loop (sync post_blocking),
+        # so serving must not require a round-trip through the loop.
+        served = backend.get_blocking(keys[0])
+
+        assert served is objs[0], (
+            "in-flight read did not serve the in-memory source buffer"
+        )
+        assert served.get_ref_count() == ref_before + 1
+
+        gate.set()
+        assert _wait_until(lambda: not backend.exists_in_put_tasks(keys[0]))
+        served.ref_count_down()
+
+    def test_batched_get_serves_inflight_puts(self, loop_thread) -> None:
+        gate = threading.Event()
+        backend = _mock_static_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(2)
+
+        _submit(backend, keys, objs)
+
+        results = backend.batched_get_blocking(keys)
+
+        assert results[0] is objs[0]
+        assert results[1] is objs[1]
+
+        gate.set()
+        assert _wait_until(lambda: not backend.progress_dict)
+        for obj in results:
+            obj.ref_count_down()
+
+
+class TestInflightRemovalTombstones:
+    """Removal wins races with active puts without recycling live storage."""
+
+    def test_static_remove_is_deferred_until_put_finishes(self, loop_thread) -> None:
+        gate = threading.Event()
+        backend = _mock_static_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(1)
+
+        _submit(backend, keys, objs)
+        assert _wait_until(lambda: keys[0] in backend.key_dict)
+
+        served = backend.get_blocking(keys[0])
+        assert served is objs[0]
+        assert backend.remove(keys[0]) is True
+        assert keys[0] in backend.pending_removals
+        assert backend.contains(keys[0]) is False
+        assert backend.get_blocking(keys[0]) is None
+        backend.storage_to_mem.assert_not_called()
+        backend.pool.push.assert_not_called()
+        served.ref_count_down()
+
+        gate.set()
+        assert _wait_until(lambda: keys[0] not in backend.progress_dict)
+        assert keys[0] not in backend.pending_removals
+        assert keys[0] not in backend.key_dict
+        backend.pool.push.assert_called_once_with(0)
+
+    def test_dynamic_file_remove_is_deferred_until_put_finishes(
+        self, loop_thread, tmp_path
+    ) -> None:
+        gate = threading.Event()
+        backend = _mock_serving_backend(loop_thread.loop, gate)
+        backend.agent.mem_type = "FILE"
+        keys, objs = _make_put(1)
+
+        path = tmp_path / "inflight-put"
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        desc = NixlDesc(device_id=fd, meta_info="", path=str(path))
+        backend._acquire_storage_handle.return_value = (
+            [desc],
+            Mock(),
+            Mock(),
+            Mock(),
+        )
+
+        try:
+            backend.batched_submit_put_task(keys, objs)
+
+            served = backend.get_blocking(keys[0])
+            assert served is objs[0]
+            assert backend.remove(keys[0]) is True
+            assert keys[0] in backend.pending_removals
+            assert backend.contains(keys[0]) is False
+            assert backend.get_blocking(keys[0]) is None
+            backend.key_exists.assert_not_called()
+            backend._allocate_for_read.assert_not_called()
+            assert path.exists()
+            served.ref_count_down()
+
+            gate.set()
+            assert _wait_until(lambda: keys[0] not in backend.progress_dict)
+            assert keys[0] not in backend.pending_removals
+            assert not path.exists()
+            backend._cache_add.assert_not_called()
+        finally:
+            os.close(fd)
+
+
+class TestInflightBorrowExceptionCleanup:
+    """A failed mixed remote read must return every in-flight borrow."""
+
+    def test_static_blocking_remote_failure_releases_borrow(self, loop_thread) -> None:
+        gate = threading.Event()
+        backend = _mock_static_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(2)
+        backend.progress_dict[keys[0]] = objs[0]
+
+        async def fail_remote(keys):
+            raise RuntimeError("remote read failed")
+
+        backend.storage_to_mem = fail_remote
+        ref_before = objs[0].get_ref_count()
+
+        with pytest.raises(RuntimeError, match="remote read failed"):
+            backend.batched_get_blocking(keys)
+
+        assert objs[0].get_ref_count() == ref_before
+
+    def test_static_nonblocking_remote_failure_releases_borrow(
+        self, loop_thread
+    ) -> None:
+        gate = threading.Event()
+        backend = _mock_static_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(2)
+        backend.progress_dict[keys[0]] = objs[0]
+
+        async def fail_remote(keys):
+            raise RuntimeError("remote read failed")
+
+        backend.storage_to_mem = fail_remote
+        ref_before = objs[0].get_ref_count()
+
+        with pytest.raises(RuntimeError, match="remote read failed"):
+            asyncio.run(backend.batched_get_non_blocking("lookup", keys))
+
+        assert objs[0].get_ref_count() == ref_before
+
+    def test_dynamic_remote_failure_releases_borrow(self, loop_thread) -> None:
+        gate = threading.Event()
+        backend = _mock_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(2)
+        backend.progress_dict[keys[0]] = objs[0]
+        backend._storage_to_mem_remote = Mock(
+            side_effect=RuntimeError("remote read failed")
+        )
+        ref_before = objs[0].get_ref_count()
+
+        with pytest.raises(RuntimeError, match="remote read failed"):
+            backend.storage_to_mem(keys)
+
+        assert objs[0].get_ref_count() == ref_before
+
+    def test_dynamic_nonblocking_remote_failure_releases_borrow(
+        self, loop_thread
+    ) -> None:
+        gate = threading.Event()
+        backend = _mock_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(2)
+        backend.progress_dict[keys[0]] = objs[0]
+        backend._storage_to_mem_remote = Mock(
+            side_effect=RuntimeError("remote read failed")
+        )
+        ref_before = objs[0].get_ref_count()
+
+        with pytest.raises(RuntimeError, match="remote read failed"):
+            asyncio.run(backend.batched_get_non_blocking("lookup", keys))
+
+        assert objs[0].get_ref_count() == ref_before
+
+
+class TestPresenceCachePublishOrdering:
+    """On success the key must be published to the presence cache BEFORE
+    its in-flight entry is removed — otherwise a concurrent lookup in the
+    gap finds the key in neither structure (hit -> miss -> hit flicker;
+    an authoritative spurious miss under presence_cache_only)."""
+
+    def test_async_publish_before_inflight_removal(self, loop_thread) -> None:
+        gate = threading.Event()
+        gate.set()  # transfer completes immediately
+        backend = _mock_serving_backend(loop_thread.loop, gate)
+        keys, objs = _make_put(1)
+
+        inflight_at_publish: list = []
+        backend._cache_add = Mock(
+            side_effect=lambda h: inflight_at_publish.append(
+                keys[0] in backend.progress_dict
+            )
+        )
+
+        backend.batched_submit_put_task(keys, objs)
+
+        assert _wait_until(lambda: len(inflight_at_publish) == 1)
+        assert inflight_at_publish[0] is True, (
+            "in-flight entry removed before the presence cache was "
+            "published — concurrent lookups see a spurious miss"
+        )
+        assert _wait_until(lambda: not backend.progress_dict)
+
+    def test_sync_publish_before_inflight_removal(self, loop_thread) -> None:
+        gate = threading.Event()
+        gate.set()
+        backend = _mock_dynamic_backend(loop_thread.loop, gate, async_mode=False)
+        keys, objs = _make_put(1)
+
+        inflight_at_publish: list = []
+        backend._cache_add = Mock(
+            side_effect=lambda h: inflight_at_publish.append(
+                keys[0] in backend.progress_dict
+            )
+        )
+
+        backend.batched_submit_put_task(keys, objs)
+
+        assert len(inflight_at_publish) == 1
+        assert inflight_at_publish[0] is True, (
+            "in-flight entry removed before the presence cache was "
+            "published — concurrent lookups see a spurious miss"
+        )
+        assert not backend.progress_dict
+
+
+# ---------------------------------------------------------------------------
+# Write-failure cleanup (behavior introduced by the parent commit; these
+# variants pin it under the serving semantics — a leaked in-flight entry
+# would now be a permanent phantom hit served from memory)
 # ---------------------------------------------------------------------------
 
 
 class TestWriteFailureCleanup:
     """A failed write must leave no trace: the key must not stay marked
-    in-flight forever, buffer references must be released, nothing may be
-    published as durable, and (static) key_dict must not point at a
-    storage slot that was never written."""
-
-    @staticmethod
-    def _dynamic_backend(loop, gate, async_mode=True):
-        backend = _mock_dynamic_backend(loop, gate, async_mode=async_mode)
-        backend.presence_cache_only = False
-        backend._cache_contains = Mock(return_value=False)
-        backend.key_exists = Mock(return_value=False)
-        for method in ("contains", "_exists_in_put_tasks_or_cache"):
-            setattr(
-                backend,
-                method,
-                types.MethodType(getattr(NixlDynamicStorageBackend, method), backend),
-            )
-        return backend
+    in-flight (a stale entry would serve a buffer whose reference the
+    writer already released), buffer references must be released, nothing
+    may be published as durable, and (static) key_dict must not point at
+    a storage slot that was never written."""
 
     def test_async_transfer_error_clears_inflight_entry(self, loop_thread) -> None:
         gate = threading.Event()
-        backend = self._dynamic_backend(loop_thread.loop, gate)
+        backend = _mock_serving_backend(loop_thread.loop, gate)
         backend.agent.nixl_agent.check_xfer_state.side_effect = lambda handle: (
             "ERR" if gate.is_set() else "PROC"
         )
@@ -481,7 +913,7 @@ class TestWriteFailureCleanup:
     ) -> None:
         """A NIXL cleanup error must not pin keys or source buffers."""
         gate = threading.Event()
-        backend = self._dynamic_backend(loop_thread.loop, gate)
+        backend = _mock_serving_backend(loop_thread.loop, gate)
         getattr(backend.agent, release_method).side_effect = RuntimeError(
             "release failed"
         )
@@ -490,7 +922,7 @@ class TestWriteFailureCleanup:
         backend.batched_submit_put_task(keys, objs)
         gate.set()
 
-        assert _wait_until(lambda: not backend.progress_set)
+        assert _wait_until(lambda: not backend.progress_dict)
         assert _wait_until(lambda: all(o.get_ref_count() == 1 for o in objs))
         backend.agent.release_storage_handler.assert_called_once()
         assert loop_thread.task_errors == []
@@ -500,15 +932,16 @@ class TestWriteFailureCleanup:
         posting the transfer must clean up after itself."""
         gate = threading.Event()
         gate.set()
-        backend = self._dynamic_backend(loop_thread.loop, gate)
+        backend = _mock_serving_backend(loop_thread.loop, gate)
         backend.agent.post_async.side_effect = RuntimeError("post failed")
         keys, objs = _make_put(2)
 
         backend.batched_submit_put_task(keys, objs)
 
-        assert _wait_until(lambda: not backend.progress_set), (
+        assert _wait_until(lambda: not backend.progress_dict), (
             "failed async post left keys marked in-flight forever"
         )
+        assert backend.contains(keys[0]) is False
         backend._cache_add.assert_not_called()
         assert _wait_until(lambda: all(o.get_ref_count() == 1 for o in objs))
         assert loop_thread.task_errors == []
@@ -516,7 +949,7 @@ class TestWriteFailureCleanup:
     def test_async_handle_acquisition_failure_is_swallowed(self, loop_thread) -> None:
         gate = threading.Event()
         gate.set()
-        backend = self._dynamic_backend(loop_thread.loop, gate)
+        backend = _mock_serving_backend(loop_thread.loop, gate)
         backend._acquire_storage_handle.side_effect = RuntimeError(
             "registration failed"
         )
@@ -524,7 +957,7 @@ class TestWriteFailureCleanup:
 
         backend.batched_submit_put_task(keys, objs)
 
-        assert _wait_until(lambda: not backend.progress_set)
+        assert _wait_until(lambda: not backend.progress_dict)
         backend._cache_add.assert_not_called()
         assert _wait_until(lambda: all(o.get_ref_count() == 1 for o in objs))
         assert loop_thread.task_errors == []
@@ -538,7 +971,8 @@ class TestWriteFailureCleanup:
         backend.direct_io_flag = 0
         backend._use_b128_object_keys = False
         backend.progress_lock = threading.Lock()
-        backend.progress_set = set()
+        backend.progress_dict = {}
+        backend.pending_removals = {}
         backend.presence_cache_only = False
         backend._cache_contains = Mock(return_value=False)
         backend._cache_add = Mock()
@@ -559,8 +993,8 @@ class TestWriteFailureCleanup:
         backend.agent.create_batched_storage_handler.side_effect = (
             fail_after_file_creation
         )
-        backend.agent.nixl_desc_exists.side_effect = (
-            lambda meta_info, path: os.path.exists(os.path.join(path, meta_info))
+        backend.agent.nixl_desc_exists.side_effect = lambda meta_info, path: (
+            os.path.exists(os.path.join(path, meta_info))
         )
 
         for method in (
@@ -594,14 +1028,14 @@ class TestWriteFailureCleanup:
         semantics, as proposed in #3956)."""
         gate = threading.Event()
         gate.set()
-        backend = self._dynamic_backend(loop_thread.loop, gate, async_mode=False)
+        backend = _mock_dynamic_backend(loop_thread.loop, gate, async_mode=False)
         backend.agent.post_blocking.side_effect = RuntimeError("transfer failed")
         on_complete = Mock()
         keys, objs = _make_put(1)
 
         backend.batched_submit_put_task(keys, objs, on_complete_callback=on_complete)
 
-        assert not backend.progress_set, (
+        assert not backend.progress_dict, (
             "failed sync transfer left the key marked in-flight forever"
         )
         backend._cache_add.assert_not_called()
@@ -613,13 +1047,7 @@ class TestWriteFailureCleanup:
         pool slot that was never written — a lookup would serve garbage.
         The slot goes back to the pool."""
         gate = threading.Event()
-        backend = _mock_static_backend(loop_thread.loop, gate)
-        for method in ("contains", "remove"):
-            setattr(
-                backend,
-                method,
-                types.MethodType(getattr(NixlStaticStorageBackend, method), backend),
-            )
+        backend = _mock_static_serving_backend(loop_thread.loop, gate)
         backend.agent.post_blocking.side_effect = RuntimeError("transfer failed")
         keys, objs = _make_put(1)
 
@@ -728,8 +1156,8 @@ class TestReadAndAcquisitionCleanup:
         handle = Mock()
         backend.agent.get_storage_to_mem_handle.return_value = handle
         release_ref_counts = []
-        backend.agent.release_handle.side_effect = (
-            lambda released_handle: release_ref_counts.append(obj.get_ref_count())
+        backend.agent.release_handle.side_effect = lambda released_handle: (
+            release_ref_counts.append(obj.get_ref_count())
         )
 
         if failure_stage == "handle":
