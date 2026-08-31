@@ -20,10 +20,10 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     List,
     Optional,
     Sequence,
-    Set,
     Tuple,
     Union,
     cast,
@@ -858,7 +858,18 @@ class NixlStorageBackend(AllocatorBackendInterface, ABC):
         self.key_lock = threading.RLock()
 
         self.progress_lock = threading.RLock()
-        self.progress_set: Set[CacheEngineKey] = set()
+        # In-flight puts: key -> the source MemoryObj still being written to
+        # storage. The buffer is guaranteed alive while the entry exists
+        # (async submit holds a reference; sync submit blocks the caller,
+        # which holds one), so readers may borrow it under progress_lock.
+        # Entries are removed before the writer releases its reference.
+        self.progress_dict: Dict[CacheEngineKey, MemoryObj] = {}
+        # Removal requests that race with an in-flight put. The writer consumes
+        # these tombstones after the transfer stops using its storage resources,
+        # then removes the completed slot/file instead of publishing it.
+        # The bool preserves the remove(force=...) value for cache-policy
+        # accounting when deferred removal is finalized.
+        self.pending_removals: Dict[CacheEngineKey, bool] = {}
 
         self.nixl_config = nixl_config
         self._local_cpu_backend: Optional["LocalCPUBackend"] = None
@@ -939,6 +950,49 @@ class NixlStorageBackend(AllocatorBackendInterface, ABC):
         if self._local_cpu_backend is not None:
             return self._local_cpu_backend.get_memory_allocator()
         return self.memory_allocator
+
+    def _borrow_inflight_puts(
+        self, keys: Sequence[CacheEngineKey]
+    ) -> Tuple[List[Optional[MemoryObj]], List[CacheEngineKey], List[int]]:
+        """Serve keys whose put is still in flight from the source buffer.
+
+        Each in-flight buffer is borrowed under ``progress_lock`` with its
+        own reference; the writer removes the entry before releasing its
+        reference, so the buffer is guaranteed alive at borrow time and
+        the borrow keeps it alive afterwards.
+
+        :param keys: The keys to look up.
+
+        :return: ``(results, remote_keys, remote_positions)`` — *results*
+            has one slot per key with the borrowed MemoryObjs filled in
+            and ``None`` elsewhere; *remote_keys* are the keys that must
+            be read from storage, *remote_positions* their indices into
+            *results*.
+        """
+        results: List[Optional[MemoryObj]] = [None] * len(keys)
+        remote_keys: List[CacheEngineKey] = []
+        remote_positions: List[int] = []
+        with self.progress_lock:
+            for i, key in enumerate(keys):
+                # A remove that races with a put takes effect logically at once.
+                # Do not borrow the source buffer or fall through to remote
+                # storage while the writer is still consuming the tombstone.
+                if key in self.pending_removals:
+                    continue
+                inflight_obj = self.progress_dict.get(key)
+                if inflight_obj is not None:
+                    inflight_obj.ref_count_up()
+                    results[i] = inflight_obj
+                else:
+                    remote_keys.append(key)
+                    remote_positions.append(i)
+        return results, remote_keys, remote_positions
+
+    def _release_get_results(self, results: Sequence[Optional[MemoryObj]]) -> None:
+        """Release get results whose ownership cannot be returned to a caller."""
+        for obj in results:
+            if obj is not None:
+                obj.ref_count_down()
 
     def allocate(
         self,
@@ -1165,6 +1219,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         added_keys: List[CacheEngineKey] = []
         popped_indices: List[int] = []
         handle: Optional[NixlXferHandle] = None
+        transfer_succeeded = False
         try:
             mem_indices = [mem_obj.meta.address for mem_obj in mem_objs]
 
@@ -1178,26 +1233,36 @@ class NixlStaticStorageBackend(NixlStorageBackend):
 
             handle = self.agent.get_mem_to_storage_handle(mem_indices, storage_indices)
             self.agent.post_blocking(handle)
+            transfer_succeeded = True
         except Exception:
-            # The slots were never (fully) written: drop the key_dict
-            # entries so lookups don't serve garbage, and return the
-            # slots to the pool.
             logger.exception(
                 "mem_to_storage failed for %d keys; rolling back", len(keys)
             )
-            for key in added_keys:
-                self.remove(key, force=True)
-            for index in popped_indices[len(added_keys) :]:
-                self.pool.push(index)
             raise
         finally:
             if handle is not None:
                 _release_handle_best_effort(self.agent, handle)
-            # Remove the in-flight entries on success AND failure — a
-            # failed put must not stay marked in-flight forever.
-            with self.progress_lock:
+
+            # A slot cannot be recycled until the transfer handle has stopped
+            # using it. Failed puts roll back every allocation; successful puts
+            # consume any removal tombstone that arrived while they were active.
+            indices_to_return = popped_indices[len(added_keys) :]
+            with self.key_lock, self.progress_lock:
+                for key in added_keys:
+                    removal_pending = key in self.pending_removals
+                    if not transfer_succeeded or removal_pending:
+                        metadata = self.key_dict.pop(key, None)
+                        if metadata is not None:
+                            indices_to_return.append(metadata.index)
+                            if not transfer_succeeded or self.pending_removals[key]:
+                                self.cache_policy.update_on_force_evict(key)
                 for key in keys:
-                    self.progress_set.discard(key)
+                    self.progress_dict.pop(key, None)
+                    self.pending_removals.pop(key, None)
+
+            for index in indices_to_return:
+                self.pool.push(index)
+
             # Release the reference taken in batched_submit_put_task; the
             # source buffer may be recycled from here on.
             for mem_obj in mem_objs:
@@ -1302,15 +1367,21 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         """
         Check whether key is in the storage backend.
 
+        A key whose put is still in flight reports a hit: its data is in
+        memory and the get path serves the source buffer directly. A pin
+        request on such a key is not recorded (the in-flight entry itself
+        cannot be evicted).
+
         :param key: The key to check
         :param pin: Whether to pin the object in the backend.
 
         :return: True if the key exists, False otherwise
         """
-        if self.exists_in_put_tasks(key):
-            return False
-
-        with self.key_lock:
+        with self.key_lock, self.progress_lock:
+            if key in self.pending_removals:
+                return False
+            if key in self.progress_dict:
+                return True
             if key in self.key_dict:
                 if pin:
                     self.key_dict[key].pin()
@@ -1326,7 +1397,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         :return: True if the key exists in put tasks, False otherwise
         """
         with self.progress_lock:
-            return key in self.progress_set
+            return key in self.progress_dict and key not in self.pending_removals
 
     def batched_submit_put_task(
         self,
@@ -1339,36 +1410,53 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         :param on_complete_callback: Optional callback (not yet supported for
             NixlCacheBackend async operations).
         """
-        # contains() reports in-flight puts as absent, so the store path can
-        # re-submit a key whose put is still running.
+        # Drop duplicate keys within this batch and keys whose put is already
+        # running. An older completion must never clear or publish a newer put.
         with self.key_lock, self.progress_lock:
-            if not self.progress_set.isdisjoint(keys):
-                kept_keys = []
-                kept_objs = []
-                for key, obj in zip(keys, memory_objs, strict=False):
-                    if key not in self.progress_set:
-                        kept_keys.append(key)
-                        kept_objs.append(obj)
-                if not kept_keys:
-                    return
-                keys, memory_objs = kept_keys, kept_objs
+            kept_keys = []
+            kept_objs = []
+            seen_keys = set()
+            for key, obj in zip(keys, memory_objs, strict=True):
+                if key in seen_keys or key in self.progress_dict:
+                    continue
+                seen_keys.add(key)
+                kept_keys.append(key)
+                kept_objs.append(obj)
+            if not kept_keys:
+                return
+            keys, memory_objs = kept_keys, kept_objs
 
             available_descs = self.pool.get_num_available_descs()
             num_evict = len(keys) - available_descs
             if num_evict > 0:
-                evict_keys = self.cache_policy.get_evict_candidates(
-                    self.key_dict, num_candidates=num_evict
+                # In-flight slots are still transfer targets and cannot be
+                # recycled. Ask for enough extra candidates to filter every
+                # active key without scanning the complete cache mapping.
+                all_candidates = self.cache_policy.get_evict_candidates(
+                    self.key_dict,
+                    num_candidates=num_evict + len(self.progress_dict),
                 )
+                evict_keys = [
+                    key for key in all_candidates if key not in self.progress_dict
+                ][:num_evict]
 
-                if not evict_keys:
+                if len(evict_keys) < num_evict:
                     logger.warning(
-                        "No eviction candidates found. Backend under pressure."
+                        "Not enough inactive eviction candidates found. "
+                        "Backend under pressure."
                     )
                     return None
 
-                self.batched_remove(evict_keys, force=False)
+                num_removed = self.batched_remove(evict_keys, force=False)
+                if num_removed != num_evict:
+                    logger.warning(
+                        "Expected to evict %d keys but removed %d; skipping put",
+                        num_evict,
+                        num_removed,
+                    )
+                    return None
 
-            self.progress_set.update(keys)
+            self.progress_dict.update(zip(keys, memory_objs, strict=True))
 
         # Hold a reference on each source buffer for the duration of the
         # transfer: the caller drops its reference as soon as this method
@@ -1387,7 +1475,8 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             coroutine.close()
             with self.progress_lock:
                 for key in keys:
-                    self.progress_set.discard(key)
+                    self.progress_dict.pop(key, None)
+                    self.pending_removals.pop(key, None)
             for memory_obj in memory_objs:
                 memory_obj.ref_count_down()
             logger.warning(
@@ -1407,10 +1496,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
 
         :return: MemoryObj. None if the key does not exist.
         """
-
-        future = asyncio.run_coroutine_threadsafe(self.storage_to_mem([key]), self.loop)
-
-        obj_list = future.result()
+        obj_list = self.batched_get_blocking([key])
         return obj_list[0] if obj_list else None
 
     def batched_get_blocking(
@@ -1422,16 +1508,31 @@ class NixlStaticStorageBackend(NixlStorageBackend):
 
         :param List[CacheEngineKey] keys: The keys of the MemoryObjs.
 
+        Keys whose put is still in flight are served directly from the
+        in-memory source buffer (borrowed with its own reference); this
+        happens on the calling thread, without a round-trip through the
+        backend event loop. Remaining keys are read from storage.
+
         :return: a list of memory objects.
         """
 
         if not keys:
             return []
 
-        future = asyncio.run_coroutine_threadsafe(self.storage_to_mem(keys), self.loop)
-
-        obj_list = future.result()
-        return obj_list
+        results, remote_keys, remote_positions = self._borrow_inflight_puts(keys)
+        try:
+            if remote_keys:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.storage_to_mem(remote_keys), self.loop
+                )
+                for position, obj in zip(
+                    remote_positions, future.result(), strict=True
+                ):
+                    results[position] = obj
+        except Exception:
+            self._release_get_results(results)
+            raise
+        return results
 
     async def batched_get_non_blocking(
         self,
@@ -1439,7 +1540,15 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         keys: list[CacheEngineKey],
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
-        obj_list = await self.storage_to_mem(keys)
+        obj_list, remote_keys, remote_positions = self._borrow_inflight_puts(keys)
+        try:
+            if remote_keys:
+                remote_objs = await self.storage_to_mem(remote_keys)
+                for position, obj in zip(remote_positions, remote_objs, strict=True):
+                    obj_list[position] = obj
+        except Exception:
+            self._release_get_results(obj_list)
+            raise
         for i, obj in enumerate(obj_list):
             if obj is None:
                 for tail_obj in obj_list[i + 1 :]:
@@ -1455,7 +1564,14 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         :param key: The key to remove.
         """
 
-        with self.key_lock:
+        with self.key_lock, self.progress_lock:
+            if key in self.progress_dict:
+                self.pending_removals[key] = (
+                    self.pending_removals.get(key, False) or force
+                )
+                return True
+            if key in self.pending_removals:
+                return True
             metadata = self.key_dict.pop(key, None)
             if metadata is None:
                 return False
@@ -1816,6 +1932,41 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
     def storage_to_mem(
         self, keys: list[CacheEngineKey], pin: bool = False
     ) -> list[Optional[MemoryObj]]:
+        """Read the given keys into newly allocated MemoryObjs.
+
+        Keys whose put is still in flight are served directly from the
+        in-memory source buffer (zero-copy): the buffer is borrowed with
+        its own reference under ``progress_lock``, so it stays alive even
+        after the writer completes and releases its reference. All other
+        keys are read from storage via NIXL.
+
+        :param keys: The keys to read.
+        :param pin: Unused (pinning is not implemented for this backend).
+
+        :return: One MemoryObj per key, ``None`` for misses. The caller
+            owns one reference on each returned object.
+        """
+        results, remote_keys, remote_positions = self._borrow_inflight_puts(keys)
+        try:
+            if remote_keys:
+                remote_objs = self._storage_to_mem_remote(remote_keys, pin)
+                for position, obj in zip(remote_positions, remote_objs, strict=True):
+                    results[position] = obj
+        except Exception:
+            self._release_get_results(results)
+            raise
+        return results
+
+    def _storage_to_mem_remote(
+        self, keys: list[CacheEngineKey], pin: bool = False
+    ) -> list[Optional[MemoryObj]]:
+        """Read the given keys from storage via a NIXL transfer.
+
+        :param keys: The keys to read (none of them in flight).
+        :param pin: Unused (pinning is not implemented for this backend).
+
+        :return: One MemoryObj per key, ``None`` for misses.
+        """
         page_size = self.memory_allocator.align_bytes
         start_time = time.time()
 
@@ -1875,6 +2026,44 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         )
         return cast(list[Optional[MemoryObj]], obj_list)
 
+    def _finalize_put_state(
+        self,
+        keys: Sequence[CacheEngineKey],
+        descs: List[NixlDesc],
+        transfer_succeeded: bool,
+    ) -> None:
+        """Publish or remove completed puts and consume removal tombstones.
+
+        Transfer resources must be released before this method is called. The
+        progress lock keeps duplicate submits out until a tombstoned FILE has
+        been unlinked, so a new put cannot lose its file to older cleanup.
+        """
+        with self.progress_lock:
+            tombstoned_indices = [
+                i for i, key in enumerate(keys) if key in self.pending_removals
+            ]
+
+            if transfer_succeeded:
+                for i, key in enumerate(keys):
+                    if i in tombstoned_indices:
+                        self._cache_discard(key.chunk_hash)
+                    else:
+                        # Publish before removing the in-flight entry, so a
+                        # concurrent lookup always finds a successful put.
+                        self._cache_add(key.chunk_hash)
+
+            if self.agent.mem_type == "FILE":
+                if transfer_succeeded:
+                    _unlink_file_descs(
+                        [descs[i] for i in tombstoned_indices if i < len(descs)]
+                    )
+                else:
+                    _unlink_file_descs(descs)
+
+            for key in keys:
+                self.progress_dict.pop(key, None)
+                self.pending_removals.pop(key, None)
+
     async def _wait_for_transfer(
         self,
         handle: NixlXferHandle,
@@ -1917,20 +2106,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 descs,
             )
 
-            if state == "DONE":
-                # Publish to the presence cache BEFORE removing the
-                # in-flight entries, so a concurrent lookup always finds
-                # the key in at least one of the two structures.
-                for key in keys:
-                    self._cache_add(key.chunk_hash)
-            elif self.agent.mem_type == "FILE":
-                _unlink_file_descs(descs)
-
-            # Remove the in-flight entries on success AND failure — a
-            # failed put must not stay marked in-flight forever.
-            with self.progress_lock:
-                for key in keys:
-                    self.progress_set.discard(key)
+            self._finalize_put_state(keys, descs, transfer_succeeded=state == "DONE")
 
             for mem_obj in mem_objs:
                 mem_obj.ref_count_down()
@@ -1959,9 +2135,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 "mem_to_storage handle acquisition failed for %d keys",
                 len(keys),
             )
-            with self.progress_lock:
-                for key in keys:
-                    self.progress_set.discard(key)
+            self._finalize_put_state(keys, [], transfer_succeeded=False)
             if self.async_mode:
                 for mem_obj in mem_objs:
                     mem_obj.ref_count_down()
@@ -2008,8 +2182,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         except Exception:
             # Fire-and-forget: the submit-side future is never queried, so
             # this exception is invisible upstream — log it, and clear the
-            # in-flight state ourselves (a failed put must not stay marked
-            # in-flight forever, nor pin its buffer).
+            # in-flight state ourselves (a leaked entry would be a
+            # permanent phantom hit served from memory, never durable).
             logger.exception(
                 "async mem_to_storage post failed for %d keys; rolling back",
                 len(keys),
@@ -2019,11 +2193,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             _release_dynamic_transfer_resources_best_effort(
                 self.agent, handle, reg_descs, xfer_handler, descs
             )
-            if self.agent.mem_type == "FILE":
-                _unlink_file_descs(descs)
-            with self.progress_lock:
-                for key in keys:
-                    self.progress_set.discard(key)
+            self._finalize_put_state(keys, descs, transfer_succeeded=False)
             for mem_obj in mem_objs:
                 mem_obj.ref_count_down()
             # Fire-and-forget async puts are best-effort. Cleanup and logging
@@ -2040,28 +2210,15 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         page_size: int,
     ) -> None:
         start_time = time.time()
+        transfer_succeeded = False
         try:
             self.agent.post_blocking(handle)
-            # Publish to the presence cache BEFORE the in-flight entries
-            # are removed (finally below), so a concurrent lookup always
-            # finds the key in at least one of the two structures. Skipped
-            # on failure: the raise bypasses it, so a failed write is
-            # never published.
-            for key in keys:
-                self._cache_add(key.chunk_hash)
-        except Exception:
-            if self.agent.mem_type == "FILE":
-                _unlink_file_descs(descs)
-            raise
+            transfer_succeeded = True
         finally:
             _release_dynamic_transfer_resources_best_effort(
                 self.agent, handle, reg_descs, xfer_handler, descs
             )
-            # Remove the in-flight entries on success AND failure — a
-            # failed put must not stay marked in-flight forever.
-            with self.progress_lock:
-                for key in keys:
-                    self.progress_set.discard(key)
+            self._finalize_put_state(keys, descs, transfer_succeeded)
 
         duration = time.time() - start_time
         logger.debug(
@@ -2077,30 +2234,27 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         :return: True if the key exists in put tasks, False otherwise
         """
         with self.progress_lock:
-            return key in self.progress_set
+            return key in self.progress_dict and key not in self.pending_removals
 
-    def _exists_in_put_tasks_or_cache(self, key: CacheEngineKey) -> tuple[bool, bool]:
-        """Check whether key exists in put tasks or presence cache.
+    def _exists_in_put_tasks_or_cache(self, key: CacheEngineKey) -> bool:
+        """Check whether the key is known to exist from local state alone.
 
-        This method only checks the local data structures and does not
-        call the expensive key_exists operation.
+        Local state is the in-flight put table (``progress_dict``) and the
+        presence cache; neither involves the expensive ``key_exists``
+        remote call. An in-flight put counts as a hit: its data is still
+        in memory and ``storage_to_mem`` serves it directly.
 
         :param key: The key to check
-        :return: Tuple of (found, result) where:
-                - found: True if we determined the result locally
-                - result: True if key exists, False if key doesn't exist
-                  (in put tasks)
+        :return: True if the key is locally known to exist. False means
+            "not known locally" — the caller decides whether to fall back
+            to the remote existence check.
         """
-        # Check if already in progress
         if self.exists_in_put_tasks(key):
             logger.debug(f"Key {key.chunk_hash:x} is in put tasks")
-            return True, False
+            return True
 
-        # Check presence cache before issuing a query_memory call if not prefetching
-        if self._cache_contains(key.chunk_hash):
-            return True, True
-
-        return False, False
+        # Check presence cache before issuing a query_memory call
+        return self._cache_contains(key.chunk_hash)
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         """
@@ -2108,7 +2262,9 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
 
         Normally this checks local put-task state and the presence cache, then
         falls back to a NIXL ``query_memory`` (queryMem) call for keys not known
-        locally; a hit from that call is added to the presence cache.
+        locally; a hit from that call is added to the presence cache. A key
+        whose put is still in flight reports a hit — its data is in memory
+        and reads serve the source buffer directly (see ``storage_to_mem``).
 
         When ``presence_cache_only`` is enabled (the ``nixl_presence_cache_only``
         config option), local put-task state and the presence cache are treated
@@ -2121,10 +2277,13 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
 
         :return: True if the key exists, False otherwise
         """
+        with self.progress_lock:
+            if key in self.pending_removals:
+                return False
+
         # Check local data structures first
-        found, local_result = self._exists_in_put_tasks_or_cache(key)
-        if found:
-            return local_result
+        if self._exists_in_put_tasks_or_cache(key):
+            return True
 
         if self.presence_cache_only:
             return False
@@ -2144,8 +2303,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
 
         Overrides the sequential base-class implementation to issue a
         single batched ``query_memory`` call for the keys that cannot
-        be resolved from local data structures (put-task set and
-        presence cache).
+        be resolved from local data structures (in-flight put table
+        and presence cache; in-flight puts count as hits).
 
         When ``presence_cache_only`` is enabled (the ``nixl_presence_cache_only``
         config option), the batched queryMem call is skipped: the method returns
@@ -2165,15 +2324,13 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         # First, do fast sequential check of local data structures
         true_count = 0
         for key in keys:
-            found, result = self._exists_in_put_tasks_or_cache(key)
-            if found:
-                if result:
-                    true_count += 1
-                else:
-                    # Found in put tasks (False), stop the loop
+            with self.progress_lock:
+                if key in self.pending_removals:
                     return true_count
+            if self._exists_in_put_tasks_or_cache(key):
+                true_count += 1
             else:
-                # Not found locally, break to do expensive checks
+                # Not known locally, break to do expensive checks
                 break
 
         # If we checked all keys locally, return the count
@@ -2187,6 +2344,13 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
 
         # For remaining keys, use the new batched_nixl_desc_exists method
         remaining_keys = keys[true_count:]
+        with self.progress_lock:
+            for i, key in enumerate(remaining_keys):
+                if key in self.pending_removals:
+                    remaining_keys = remaining_keys[:i]
+                    break
+        if not remaining_keys:
+            return true_count
         reg_list = [(0, 0, 0, self._format_object_key(key)) for key in remaining_keys]
 
         # Use the agent's batched_nixl_desc_exists method
@@ -2241,9 +2405,22 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         :param on_complete_callback: Optional callback invoked once per key
             after transfer completes. Only supported in sync mode (async_mode=False).
         """
+        # An older transfer must not pop or publish state belonging to a newer
+        # duplicate. Keep the first active put, matching the static backend.
         with self.progress_lock:
-            for key in keys:
-                self.progress_set.add(key)
+            kept_keys = []
+            kept_objs = []
+            seen_keys = set()
+            for key, memory_obj in zip(keys, memory_objs, strict=True):
+                if key in seen_keys or key in self.progress_dict:
+                    continue
+                seen_keys.add(key)
+                kept_keys.append(key)
+                kept_objs.append(memory_obj)
+            if not kept_keys:
+                return
+            keys, memory_objs = kept_keys, kept_objs
+            self.progress_dict.update(zip(keys, memory_objs, strict=True))
 
         if self.async_mode:
             for mem_obj in memory_objs:
@@ -2258,7 +2435,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             coroutine.close()
             with self.progress_lock:
                 for key in keys:
-                    self.progress_set.discard(key)
+                    self.progress_dict.pop(key, None)
+                    self.pending_removals.pop(key, None)
             if self.async_mode:
                 for mem_obj in memory_objs:
                     mem_obj.ref_count_down()
@@ -2279,7 +2457,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         except Exception as e:
             with self.progress_lock:
                 for key in keys:
-                    self.progress_set.discard(key)
+                    self.progress_dict.pop(key, None)
+                    self.pending_removals.pop(key, None)
             logger.warning(
                 "NIXL batched put failed for %d key(s); "
                 "skipping best-effort offload: %s",
@@ -2350,12 +2529,25 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         :param force: Whether to force removal (not used in this implementation)
         :return: True if the key is removed, False otherwise.
         """
-        self._cache_discard(key.chunk_hash)
-        if self.agent.mem_type == "FILE":
-            try:
-                os.unlink(os.path.join(self.path, self._format_object_key(key)))
-            except FileNotFoundError:
-                return False
+        with self.progress_lock:
+            if key in self.progress_dict:
+                self.pending_removals[key] = (
+                    self.pending_removals.get(key, False) or force
+                )
+                self._cache_discard(key.chunk_hash)
+                return True
+            if key in self.pending_removals:
+                return True
+
+            # Serialize an immediate unlink with put registration. Otherwise a
+            # new put could register and create its FILE after the check above
+            # but before unlink, and this remove would delete the new write.
+            self._cache_discard(key.chunk_hash)
+            if self.agent.mem_type == "FILE":
+                try:
+                    os.unlink(os.path.join(self.path, self._format_object_key(key)))
+                except FileNotFoundError:
+                    return False
 
         return True
 

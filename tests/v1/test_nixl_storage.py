@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 
 # Third Party
@@ -96,6 +97,21 @@ def create_key(chunk_hash: str):
     )
 
 
+def _wait_puts_drained(backend, keys, timeout: float = 30.0) -> None:
+    """Block until no key is in flight anymore.
+
+    In-flight puts are served directly from the in-memory source buffer;
+    these tests verify the storage round-trip (data written out and read
+    back into a *different* buffer), so they must wait for the write to
+    land before reading.
+    """
+    deadline = time.monotonic() + timeout
+    while any(backend.exists_in_put_tasks(key) for key in keys):
+        if time.monotonic() > deadline:
+            raise TimeoutError("puts still in flight after %.0fs" % timeout)
+        time.sleep(0.01)
+
+
 def run(config: LMCacheEngineConfig, shape, dtype):
     BACKEND_NAME = "NixlStorageBackend"
     keys = []
@@ -175,6 +191,7 @@ def run(config: LMCacheEngineConfig, shape, dtype):
         first_keys = keys[0:2]
         first_objs = objs[0:2]
         nixl_backend.batched_submit_put_task(first_keys, first_objs)
+        _wait_puts_drained(nixl_backend, first_keys)
 
         for key, obj in zip(first_keys, first_objs, strict=False):
             returned_memory_obj = nixl_backend.get_blocking(key)
@@ -210,6 +227,7 @@ def run(config: LMCacheEngineConfig, shape, dtype):
 
         def test_eviction(new_idx, old_idx):
             nixl_backend.batched_submit_put_task([keys[new_idx]], [objs[new_idx]])
+            _wait_puts_drained(nixl_backend, [keys[new_idx]])
 
             obj = nixl_backend.get_blocking(keys[new_idx])
             assert obj is not None
